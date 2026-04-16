@@ -1,0 +1,40 @@
+# ============================================
+# Cosmos-NVSyn Requirements
+# Optimized for Cosmos-Predict2.5 + Medical CT Training
+# ============================================
+
+# === Core Training ===
+lightning
+hydra-core==1.3.2
+omegaconf==2.3.0
+bitsandbytes
+
+# === Medical Imaging ===
+monai==1.5.1
+medpy
+
+# === Video & Image Processing ===
+decord==0.6.0
+tqdm==4.66.5
+moviepy==1.0.3
+imageio[pyav,ffmpeg]==2.37.0
+nibabel
+
+# === General Dependencies ===
+einops==0.8.1
+gdown
+rich
+click
+
+# === Cosmos-Predict2.5 ===
+megatron-core==0.10.0
+diffusers==0.33.1
+transformers==4.51.3
+
+# === Logging & Visualization ===
+tensorboard
+wandb
+gradio>=4.44.0
+
+# === Cloud Storage ===
+google-cloud-storage
