@@ -22,7 +22,7 @@ from cosmos_predict2._src.predict2.networks.minimal_v1_lvg_dit import MinimalV1L
 from cosmos_predict2._src.predict2.networks.minimal_v4_dit import SACConfig
 from cosmos_predict2._src.predict2.tokenizers.wan2pt1 import Wan2pt1VAEInterface
 
-from predict2_5.constants import COSMOS_TOKENIZER_UUID, IMG_HEIGHT, IMAGE_WIDTH, NUM_FRAMES, PROMPTS
+from predict2_5.constants import COSMOS_TOKENIZER_UUID, IMG_HEIGHT, IMG_WIDTH, NUM_FRAMES, PROMPTS
 from predict2_5.hf import hf_download, resolve_hf_uri
 from predict2_5.text_encoder import CR1TextEncoder
 from predict2_5.utils import arch_invariant_rand, fix_rope_buffers, move_tokenizer_to_device, get_logger, is_uuid_format, safe_torch_load
@@ -505,7 +505,7 @@ class Inferencer:
         pil_img = self._to_pil_rgb(image)
 
         # Resize and convert to tensor
-        resized_image = pil_img.resize((IMAGE_WIDTH, IMG_HEIGHT), resample=Image.BICUBIC)
+        resized_image = pil_img.resize((IMG_WIDTH, IMG_HEIGHT), resample=Image.BICUBIC)
         np_image = np.asarray(resized_image, dtype=np.uint8)
 
         # Get the first frame of the input video, normalize to [0, 1], and convert to tensor with shape (1, C, H, W)
