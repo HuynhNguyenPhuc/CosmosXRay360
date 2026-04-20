@@ -1,8 +1,8 @@
 """
- Predict 2.5 X-Ray demo.
+Predict 2.5 X-Ray demo.
 
 Usage:
-    python app.py --checkpoint-path outputs/your.ckpt
+    python app.py --checkpoint-path outputs/your.ckpt --share
 """
 
 from __future__ import annotations
@@ -34,6 +34,81 @@ MODEL_CACHE = {
 
 # --- Logger --- #
 logger = get_logger(__name__)
+
+
+def compute_stretch_range(frames: list[np.ndarray]) -> list[float] | None:
+    """
+    Compute shared [low, high] percentile range for clip-level contrast stretching across all frames.
+
+    Args:
+        frames: List of frames as uint8 numpy arrays.
+
+    Returns:
+        List of [low, high] values for contrast stretching, or None if computation fails.
+    """
+    if not frames:
+        return None
+
+    # Sample pixel values from all frames to estimate histogram
+    samples = []
+    for frame in frames:
+        # Convert to grayscale and subsample
+        if frame.ndim == 2:
+            gray = np.asarray(frame, dtype=np.float32)
+        elif frame.shape[-1] == 1:
+            gray = np.asarray(frame[..., 0], dtype=np.float32)
+        else:
+            rgb = np.asarray(frame[..., :3], dtype=np.float32)
+            gray = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+
+        samples.append(gray.reshape(-1)[::16])
+
+    # Compute percentiles
+    sampled_values = np.concatenate(samples, axis=0)
+    low = float(np.percentile(sampled_values, 1.0))
+    high = float(np.percentile(sampled_values, 99.0))
+
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+        return None
+
+    return [low, high]
+
+
+def apply_display_postprocess(
+    frame: np.ndarray,
+    display_mode: str = "normal",
+    stretch_range: list[float] | None = None,
+) -> np.ndarray:
+    """
+    Unified display postprocessing: convert to grayscale, apply contrast stretch if requested, 
+    convert to uint8 RGB for display.
+
+    Args:
+        frame: Input frame as a numpy array (H, W) or (H, W, C).
+        display_mode: Display preset mode ("normal" or "contrast_stretch").
+        stretch_range: Optional [low, high] clip-level stretch parameters (display-only).
+
+    Returns:
+        Postprocessed frame as uint8 RGB numpy array (H, W, 3).
+    """
+    # Convert to grayscale (luminance from RGB or pass through if already grayscale)
+    if frame.ndim == 2:
+        gray = np.asarray(frame, dtype=np.float32)
+    elif frame.shape[-1] == 1:
+        gray = np.asarray(frame[..., 0], dtype=np.float32)
+    else:
+        rgb = np.asarray(frame[..., :3], dtype=np.float32)
+        gray = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+
+    # Apply clip-level contrast stretch if requested (display-only, does not modify model output)
+    if display_mode == "contrast_stretch" and stretch_range is not None:
+        low, high = stretch_range
+        if high > low:
+            gray = (gray - low) * (255.0 / (high - low))
+
+    # Convert to uint8 RGB
+    gray_uint8 = np.clip(gray, 0, 255).astype(np.uint8, copy=False)
+    return np.repeat(gray_uint8[..., None], 3, axis=-1)
 
 
 def get_or_load_model(
@@ -76,13 +151,20 @@ def get_or_load_model(
     return model
 
 
-def save_video(frames: list[np.ndarray], fps: int = 16) -> str:
+def save_video(
+    frames: list[np.ndarray],
+    fps: int = 16,
+    display_mode: str = "normal",
+    stretch_range: list[float] | None = None,
+) -> str:
     """
     Save frame list to MP4 video file.
     
     Args:
         frames: List of uint8 numpy arrays (H, W, C).
         fps: Frames per second for output video.
+        display_mode: Preview mode, either "normal" or "contrast_stretch".
+        stretch_range: Shared [low, high] range for clip-level contrast stretching.
     
     Returns:
         Path to saved MP4 file.
@@ -90,11 +172,19 @@ def save_video(frames: list[np.ndarray], fps: int = 16) -> str:
     # Create a temporary directory to store the video file
     tmp_dir = Path(tempfile.mkdtemp(prefix="xray_views_"))
     video_path = tmp_dir / "views.mp4"
+    display_frames = [
+        apply_display_postprocess(
+            frame,
+            display_mode=display_mode,
+            stretch_range=stretch_range,
+        )
+        for frame in frames
+    ]
 
     # Use imageio to save the frames as an MP4 video.
     imageio.mimsave(
         str(video_path), 
-        frames, 
+        display_frames,
         fps=fps, 
         macro_block_size=1
     )
@@ -102,20 +192,31 @@ def save_video(frames: list[np.ndarray], fps: int = 16) -> str:
     return str(video_path)
 
 
-def frames_to_image(frames: list[np.ndarray], frame_idx: int) -> np.ndarray:
+def frames_to_image(
+    frames: list[np.ndarray],
+    frame_idx: int,
+    display_mode: str = "normal",
+    stretch_range: list[float] | None = None,
+) -> np.ndarray:
     """
     Extract single frame from list, clamping index to valid range.
     
     Args:
         frames: List of frame arrays.
         frame_idx: Desired frame index (will be clamped).
+        display_mode: Preview mode, either "normal" or "contrast_stretch".
+        stretch_range: Shared [low, high] range for clip-level contrast stretching.
     
     Returns:
         Single frame as uint8 numpy array.
     """
     frame_idx = int(np.clip(frame_idx, 0, len(frames) - 1))
 
-    return frames[frame_idx]
+    return apply_display_postprocess(
+        frames[frame_idx],
+        display_mode=display_mode,
+        stretch_range=stretch_range,
+    )
 
 
 def generate_video(
@@ -212,6 +313,12 @@ def build_app(checkpoint_path: str, config_path: str) -> gr.Blocks:
                     value=35,
                     info="More steps = better quality but slower",
                 )
+                display_mode = gr.Radio(
+                    label="Display Mode",
+                    choices=[("Standard", "normal"), ("Enhanced Contrast", "contrast_stretch")],
+                    value="normal",
+                    info="Preview only. Does not change raw model output.",
+                )
 
                 run_btn = gr.Button("Generate Video", variant="primary", size="lg")
 
@@ -239,45 +346,122 @@ def build_app(checkpoint_path: str, config_path: str) -> gr.Blocks:
                 )
 
         # State for storing results between interactions
+        # State variables for frame data and display settings
         frames_state = gr.State([])
+        stretch_range_state = gr.State(None)
         ckpt_state = gr.State(checkpoint_path)
         config_state = gr.State(config_path)
 
         # Define event handler for video generation
-        def on_generate(xray_image, cfg, steps, ckpt_path, cfg_path):
+        def on_generate(
+            xray_image,
+            cfg_scale,
+            num_steps,
+            display_mode,
+            checkpoint_path,
+            config_path,
+        ):
             """Generate video and prepare outputs."""
             status_msg, frames = generate_video(
                 xray_image=xray_image,
-                cfg=cfg,
-                steps=steps, 
-                ckpt_path=ckpt_path, 
-                cfg_path=cfg_path
+                cfg_scale=cfg_scale,
+                num_steps=num_steps, 
+                checkpoint_path=checkpoint_path, 
+                config_path=config_path
             )
+
+            stretch_range = compute_stretch_range(frames)
 
             first_frame = (
-                frames[0] if frames else np.zeros((256, 256, 3), dtype=np.uint8)
+                apply_display_postprocess(
+                    frames[0],
+                    display_mode=display_mode,
+                    stretch_range=stretch_range,
+                )
+                if frames
+                else np.zeros((256, 256, 3), dtype=np.uint8)
             )
-            video_path = save_video(frames) if frames else None
+            video_path = (
+                save_video(
+                    frames,
+                    display_mode=display_mode,
+                    stretch_range=stretch_range,
+                )
+                if frames
+                else None
+            )
 
-            return status_msg, frames, gr.update(value=0), first_frame, video_path
+            return (
+                status_msg,
+                frames,
+                stretch_range,
+                gr.update(value=0),
+                first_frame,
+                video_path,
+            )
 
-        def on_frame_change(frames, idx):
+        def on_frame_change(frames, idx, display_mode, stretch_range):
             """Update frame display when slider changes."""
             if not frames or idx is None:
                 return np.zeros((256, 256, 3), dtype=np.uint8)
             
-            return frames_to_image(frames, int(idx))
+            return frames_to_image(
+                frames,
+                int(idx),
+                display_mode=display_mode,
+                stretch_range=stretch_range,
+            )
+
+        def on_display_mode_change(frames, idx, display_mode, stretch_range):
+            """Re-render preview assets when the display mode changes."""
+            if not frames:
+                return np.zeros((256, 256, 3), dtype=np.uint8), None
+
+            frame_idx = 0 if idx is None else int(idx)
+            frame_image = frames_to_image(
+                frames,
+                frame_idx,
+                display_mode=display_mode,
+                stretch_range=stretch_range,
+            )
+            video_path = save_video(
+                frames,
+                display_mode=display_mode,
+                stretch_range=stretch_range,
+            )
+
+            return frame_image, video_path
 
         run_btn.click(
             fn=on_generate,
-            inputs=[xray_input, cfg_scale, num_steps, ckpt_state, config_state],
-            outputs=[status, frames_state, frame_idx, frame_display, video_output],
+            inputs=[
+                xray_input,
+                cfg_scale,
+                num_steps,
+                display_mode,
+                ckpt_state,
+                config_state,
+            ],
+            outputs=[
+                status,
+                frames_state,
+                stretch_range_state,
+                frame_idx,
+                frame_display,
+                video_output,
+            ],
         )
 
         frame_idx.change(
             fn=on_frame_change,
-            inputs=[frames_state, frame_idx],
+            inputs=[frames_state, frame_idx, display_mode, stretch_range_state],
             outputs=frame_display,
+        )
+
+        display_mode.change(
+            fn=on_display_mode_change,
+            inputs=[frames_state, frame_idx, display_mode, stretch_range_state],
+            outputs=[frame_display, video_output],
         )
 
     return demo

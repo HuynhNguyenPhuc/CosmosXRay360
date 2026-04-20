@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import json
 from pathlib import Path
@@ -63,6 +64,9 @@ class Inferencer:
         # Determine device with fallback to CPU if CUDA is not available
         self.device = device if torch.cuda.is_available() and device == "cuda" else "cpu"
         
+        # Runtime compute dtype used by autocast during denoising.
+        self.runtime_dtype = torch.bfloat16
+
         # CPU offload flag
         self.cpu_offload = bool(cpu_offload)
 
@@ -258,11 +262,15 @@ class Inferencer:
             state_dict = ckpt
 
         # Non-strict loading to allow missing and unexpected keys.
-        missing, unexpected = non_strict_load_model(dit, state_dict)
-        if missing:
-            log.warning("Missing keys while loading DiT: %s", missing[:5])
-        if unexpected:
-            log.warning("Unexpected keys while loading DiT: %s", unexpected[:5])
+        load_result = non_strict_load_model(dit, state_dict)
+        if isinstance(load_result, tuple) and len(load_result) >= 2:
+            missing, unexpected = load_result[0], load_result[1]
+            if missing:
+                log.warning("Missing keys while loading DiT: %s", missing[:5])
+            if unexpected:
+                log.warning("Unexpected keys while loading DiT: %s", unexpected[:5])
+        elif isinstance(load_result, (list, tuple)):
+            log.warning("Checkpoint loaded with info: %s", load_result)
 
         # Move model to target device
         dit = dit.to(self.device)
@@ -434,12 +442,13 @@ class Inferencer:
                 + xt_b_c_t_h_w * (1 - condition_video_mask)
             )
 
-        # Run the DiT forward pass to predict the velocity
-        net_output = self.dit(
-            x_B_C_T_H_W=xt_b_c_t_h_w.to(device=self.device, dtype=model_dtype),
-            timesteps_B_T=timesteps_b_t.to(device=self.device, dtype=model_dtype),
-            **condition.to_dict(),
-        ).float()
+        # Run the DiT forward pass to predict the velocity.
+        with torch.autocast(device_type=self.device, dtype=self.runtime_dtype): 
+            net_output = self.dit(
+                x_B_C_T_H_W=xt_b_c_t_h_w.to(device=self.device, dtype=model_dtype),
+                timesteps_B_T=timesteps_b_t.to(device=self.device, dtype=model_dtype),
+                **condition.to_dict()
+            ).float()
 
         # FRAME REPLACEMENT OUTPUT: Replace predicted velocity of conditioning frames with GT velocity
         # In rectified flow: v_t = x_T - x_0, so GT velocity = noise - gt_frames
@@ -459,6 +468,12 @@ class Inferencer:
     def _to_pil_rgb(image: Union[np.ndarray, Image.Image]) -> Image.Image:
         """
         Convert input image to RGB Pillow image format.
+
+        Args:
+            image: Input image as a numpy array (H, W), (H, W, C), or a PIL Image.
+
+        Returns:
+            A PIL Image in RGB mode.
         """
         if isinstance(image, Image.Image):
             # If it's already a PIL Image, convert to RGB if not already
@@ -476,6 +491,30 @@ class Inferencer:
             image = np.clip(image, 0, 255).astype(np.uint8)
 
         return Image.fromarray(image, mode="RGB")
+
+    @staticmethod
+    def _scale_image_intensity(image: np.ndarray) -> np.ndarray:
+        """
+        Scale image intensity to [0, 1] range.
+
+        Args:
+            image: Input image as a numpy array.
+
+        Returns:
+            Scaled image as a numpy array with values in [0, 1].
+        """
+        image = np.asarray(image, dtype=np.float32).copy()
+
+        # Min-max scaling to [0, 1]
+        image_min = float(image.min())
+        image_max = float(image.max())
+
+        if image_max > image_min:
+            image = (image - image_min) / (image_max - image_min)
+        else:
+            image.fill(0.0)
+
+        return image
 
     @torch.inference_mode()
     def predict(
@@ -506,13 +545,15 @@ class Inferencer:
 
         # Resize and convert to tensor
         resized_image = pil_img.resize((IMG_WIDTH, IMG_HEIGHT), resample=Image.BICUBIC)
-        np_image = np.asarray(resized_image, dtype=np.uint8)
+        
+        # Scale image intensity to [0, 1] range
+        np_image = self._scale_image_intensity(np.asarray(resized_image, dtype=np.float32))
 
-        # Get the first frame of the input video, normalize to [0, 1], and convert to tensor with shape (1, C, H, W)
+        # Get the first frame of the input video, and convert to tensor with shape (1, C, H, W)
         anchor_frame = (
-            torch.from_numpy(np_image).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+            torch.from_numpy(np_image).permute(2, 0, 1).unsqueeze(0)
         ).to(self.device)
-        # Thẹn, normalize to [-1, 1]
+        # Then, normalize to [-1, 1]
         anchor_frame = anchor_frame * 2.0 - 1.0
         # Add temporal dimension to make it (1, C, 1, H, W)
         anchor_frame = anchor_frame.unsqueeze(2) 
