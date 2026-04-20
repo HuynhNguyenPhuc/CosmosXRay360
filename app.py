@@ -1,4 +1,5 @@
-"""Cosmos Predict 2.5 X-Ray demo with fixed 93-frame video output.
+"""
+ Predict 2.5 X-Ray demo.
 
 Usage:
     python app.py --checkpoint-path outputs/your.ckpt
@@ -6,208 +7,186 @@ Usage:
 
 from __future__ import annotations
 
-# Must be set before ANY cosmos_predict2 import so checkpoint_db registers
-# experimental UUIDs (tokenizer + base model) at module load time.
+# Must be set before ANY cosmos_predict2 import so checkpoint_db registers experimental UUIDs (tokenizer + base model) at module load time.
 import os
-
 os.environ.setdefault("COSMOS_EXPERIMENTAL_CHECKPOINTS", "1")
 
 import argparse
-import pickle
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
 
 import gradio as gr
 import imageio.v2 as imageio
-import numpy as np
-import torch
-from PIL import Image
 
-from predict2_5.constants import CR1_EMBEDDING_DIM, CR1_MAX_LENGTH, NUM_FRAMES, PROMPTS
+import numpy as np
+
+import torch
+
+from predict2_5.constants import NUM_FRAMES
 from predict2_5.utils import get_logger
 
-_MODEL_CACHE = {"model": None, "device": None, "checkpoint_path": None}
-_EMBEDDING_CACHE: dict[str, torch.Tensor] = {}
-log = get_logger(__name__)
+
+MODEL_CACHE = {
+    "model": None, 
+    "device": None, 
+    "checkpoint_path": None
+}
+
+# --- Logger --- #
+logger = get_logger(__name__)
 
 
-def _prompt_to_filename(prompt: str) -> str:
-    """Convert prompt to embedding filename (matches get_cosmos_reason_embeddings.py)."""
-    return (
-        (prompt.strip().replace(" ", "_").replace("'", "").replace(",", "")[:100])
-        or "null"
-    )
-
-
-def _load_text_embedding(embeddings_dir: str, prompt: str) -> torch.Tensor:
-    """Load pre-computed text embedding from disk, fallback to zeros.
-
-    Returns tensor of shape (1, seq_len, CR1_EMBEDDING_DIM).
+def get_or_load_model(
+    checkpoint_path: str, 
+    config_path: str, 
+    device: str
+):
     """
-    cache_key = f"{embeddings_dir}::{prompt}"
-    if cache_key in _EMBEDDING_CACHE:
-        return _EMBEDDING_CACHE[cache_key]
+    Get or load the Inferencer model, with caching to avoid redundant loads.
 
-    emb_path = Path(embeddings_dir) / f"{_prompt_to_filename(prompt)}.pkl"
+    Args:
+        checkpoint_path: Path to the model checkpoint.
+        config_path: Path to the model config file.
+        device: Device to load the model on ("cuda" or "cpu").
 
-    embedding: torch.Tensor | None = None
-    if emb_path.exists():
-        try:
-            with open(emb_path, "rb") as f:
-                data = pickle.load(f)  # list[Tensor(seq_len, embed_dim)]
-            raw = data[0] if isinstance(data, list) else data
-            embedding = torch.as_tensor(raw, dtype=torch.float32).unsqueeze(
-                0
-            )  # (1, L, D)
-        except Exception as e:
-            log.warning("[app] could not load embedding %s: %s", emb_path, e)
-
-    if embedding is None:
-        log.warning("[app] embedding not found, using zeros: %s", emb_path)
-        embedding = torch.zeros(
-            (1, CR1_MAX_LENGTH, CR1_EMBEDDING_DIM), dtype=torch.float32
-        )
-
-    _EMBEDDING_CACHE[cache_key] = embedding
-    return embedding
-
-
-def _ensure_checkpoint_db_compat() -> None:
-    """Install compatibility shim for legacy checkpoint resolver API.
-
-    Some local code imports get_checkpoint_by_uuid from checkpoint_db, while
-    newer checkpoint_db exposes get_checkpoint_uri/get_checkpoint_path.
-    Also ensures checkpoints are registered (cosmos_predict2.config does this
-    normally, but predict2_5.module doesn't import it).
+    Returns:
+        Loaded Inferencer model.
     """
-    from cosmos_predict2._src.imaginaire.utils import checkpoint_db
-
-    # Populate the _CHECKPOINTS registry (normally done by cosmos_predict2.config).
-    from cosmos_oss.checkpoints_predict2 import register_checkpoints
-
-    register_checkpoints()
-
-    if hasattr(checkpoint_db, "get_checkpoint_by_uuid"):
-        return
-
-    def _get_checkpoint_by_uuid(uuid: str) -> SimpleNamespace:
-        resolved_uri = checkpoint_db.get_checkpoint_uri(uuid)
-        resolved_path = checkpoint_db.get_checkpoint_path(resolved_uri)
-        return SimpleNamespace(path=resolved_path)
-
-    checkpoint_db.get_checkpoint_by_uuid = _get_checkpoint_by_uuid
-
-
-def _to_pil(image_np: np.ndarray) -> Image.Image:
-    """Convert numpy image to RGB PIL image."""
-    if image_np.ndim == 2:
-        image_np = np.stack([image_np] * 3, axis=-1)
-    if image_np.shape[-1] == 4:
-        image_np = image_np[..., :3]
-    if image_np.dtype != np.uint8:
-        image_np = np.clip(image_np, 0, 255).astype(np.uint8)
-    return Image.fromarray(image_np, mode="RGB")
-
-
-def _get_or_load_model(checkpoint_path: str, config_path: str, device: str):
-    """Return cached model instance for the same checkpoint/device."""
+    # If the model is already loaded with the same checkpoint and device, return it from cache
     if (
-        _MODEL_CACHE["model"] is not None
-        and _MODEL_CACHE["checkpoint_path"] == checkpoint_path
-        and _MODEL_CACHE["device"] == device
+        MODEL_CACHE["model"] is not None
+        and MODEL_CACHE["checkpoint_path"] == checkpoint_path
+        and MODEL_CACHE["device"] == device
     ):
-        return _MODEL_CACHE["model"]
+        return MODEL_CACHE["model"]
 
-    _ensure_checkpoint_db_compat()
+    # If not cached, load the model and store it in the cache
     from predict2_5.inferencer import Inferencer
 
     model = Inferencer(
-        checkpoint_path=checkpoint_path, config_path=config_path, device=device
+        checkpoint_path=checkpoint_path,
+        config_path=config_path,
+        device=device,
     )
 
-    _MODEL_CACHE["model"] = model
-    _MODEL_CACHE["checkpoint_path"] = checkpoint_path
-    _MODEL_CACHE["device"] = device
+    MODEL_CACHE["model"] = model
+    MODEL_CACHE["checkpoint_path"] = checkpoint_path
+    MODEL_CACHE["device"] = device
+
     return model
 
 
-def _save_video(frames: list[np.ndarray], fps: int = 16) -> str:
-    """Save frames to MP4 and return path."""
+def save_video(frames: list[np.ndarray], fps: int = 16) -> str:
+    """
+    Save frame list to MP4 video file.
+    
+    Args:
+        frames: List of uint8 numpy arrays (H, W, C).
+        fps: Frames per second for output video.
+    
+    Returns:
+        Path to saved MP4 file.
+    """
+    # Create a temporary directory to store the video file
     tmp_dir = Path(tempfile.mkdtemp(prefix="xray_views_"))
     video_path = tmp_dir / "views.mp4"
-    imageio.mimsave(str(video_path), frames, fps=fps, macro_block_size=1)
+
+    # Use imageio to save the frames as an MP4 video.
+    imageio.mimsave(
+        str(video_path), 
+        frames, 
+        fps=fps, 
+        macro_block_size=1
+    )
+
     return str(video_path)
 
 
-def _frames_to_image(frames: list[np.ndarray], frame_idx: int) -> np.ndarray:
-    """Extract a single frame from the list, clamp to bounds."""
+def frames_to_image(frames: list[np.ndarray], frame_idx: int) -> np.ndarray:
+    """
+    Extract single frame from list, clamping index to valid range.
+    
+    Args:
+        frames: List of frame arrays.
+        frame_idx: Desired frame index (will be clamped).
+    
+    Returns:
+        Single frame as uint8 numpy array.
+    """
     frame_idx = int(np.clip(frame_idx, 0, len(frames) - 1))
+
     return frames[frame_idx]
 
 
-def _predict_video_from_model(
-    xray_image: np.ndarray,
-    checkpoint_path: str,
-    config_path: str,
-    cfg_scale: float,
-    num_steps: int,
-) -> list[np.ndarray]:
-    """Generate a fixed NUM_FRAMES video with model.generate."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = _get_or_load_model(checkpoint_path, config_path, device)
-
-    # Use the new predict interface
-    prompt = PROMPTS[0] if PROMPTS else ""
-    frames = model(
-        image=xray_image,
-        prompt=prompt,
-        cfg_scale=float(cfg_scale),
-        num_steps=int(num_steps),
-    )
-    return frames
-
-
-def generate_views_ui(
+def generate_video(
     xray_image: np.ndarray | None,
     cfg_scale: float,
     num_steps: int,
     checkpoint_path: str,
     config_path: str,
 ) -> tuple[str, list[np.ndarray]]:
-    """Generate one 93-frame video from one X-Ray image, return frames list."""
+    """
+    Generate video from an uploaded X-Ray image.
+    
+    Args:
+        xray_image: Uploaded X-Ray image as a numpy array (H, W, C).
+        cfg_scale: Classifier-free guidance scale.
+        num_steps: Number of diffusion steps.
+        checkpoint_path: Path to model checkpoint.
+        config_path: Path to model config.
+    
+    Returns:
+        Tuple of (status_message, list_of_frames).
+    """
     if xray_image is None:
         return "Please upload an X-Ray image.", []
+    
     try:
-        frames = _predict_video_from_model(
-            xray_image=xray_image,
-            checkpoint_path=checkpoint_path,
-            config_path=config_path,
+        # Get the current device
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Get or load the model (with caching)
+        model = get_or_load_model(checkpoint_path, config_path, device)
+
+        # Run inference to get the video
+        frames = model.predict(
+            image=xray_image,
             cfg_scale=float(np.clip(cfg_scale, 0.0, 6.0)),
             num_steps=int(np.clip(num_steps, 5, 80)),
         )
-        return f"Generated {len(frames)} views (fixed to {NUM_FRAMES}).", frames
+
+        return f"✓ Generated {len(frames)} views.", frames
     except Exception as e:
-        return f"Model inference failed: {e}", []
+        logger.error("Inference failed: %s", e)
+        return f"❌ Model inference failed: {e}", []
 
 
 def build_app(checkpoint_path: str, config_path: str) -> gr.Blocks:
-    """Build minimal UI: image input + CFG/steps controls + video + frame slider."""
+    """
+    Build the Gradio app interface.
+
+    Args:
+        checkpoint_path: Path to model checkpoint.
+        config_path: Path to model config.
+
+    Returns:
+        Gradio Blocks object representing the app.
+    """
+    # Get the current device
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    with gr.Blocks(
-        title="Cosmos Predict 2.5 Post-training for Medical Image Dataset"
-    ) as demo:
-        gr.Markdown("## Cosmos Predict 2.5 Post-training for Medical Image Dataset")
+    with gr.Blocks(title="Cosmos Predict 2.5 X-Ray Video Generation") as demo:
+        gr.Markdown("## Cosmos Predict 2.5 X-Ray Video Generation")
 
-        # Eager load model on startup
+        # Load model at startup and show status
         try:
-            _get_or_load_model(checkpoint_path, config_path, device)
+            get_or_load_model(checkpoint_path, config_path, device)
             gr.Markdown(f"✓ Model loaded on **{device.upper()}**")
         except Exception as e:
             gr.Markdown(f"⚠ Failed to load model: {e}")
             return demo
 
+        # Input section: image upload + inference controls
         with gr.Row():
             xray_input = gr.Image(
                 label="Upload X-Ray Image",
@@ -215,27 +194,40 @@ def build_app(checkpoint_path: str, config_path: str) -> gr.Blocks:
                 image_mode="RGB",
                 sources=["upload", "clipboard"],
             )
+
             with gr.Column():
                 cfg_scale = gr.Slider(
-                    label="CFG", minimum=0.0, maximum=6.0, step=0.1, value=1.5
+                    label="CFG Scale",
+                    minimum=0.0,
+                    maximum=6.0,
+                    step=0.1,
+                    value=1.5,
+                    info="Higher = stronger conditioning",
                 )
                 num_steps = gr.Slider(
-                    label="Num Steps", minimum=5, maximum=80, step=1, value=35
+                    label="Inference Steps",
+                    minimum=5,
+                    maximum=80,
+                    step=1,
+                    value=35,
+                    info="More steps = better quality but slower",
                 )
-                run_btn = gr.Button("Generate Video", variant="primary")
 
-        status = gr.Textbox(label="Status", interactive=False)
+                run_btn = gr.Button("Generate Video", variant="primary", size="lg")
 
+        status = gr.Textbox(label="Status", interactive=False, lines=1)
+
+        # Output section: video player + frame inspector
         with gr.Row():
-            with gr.Column():
-                # Native browser video player – smooth scrubbing with zero server latency
+            with gr.Column(scale=2):
+                # Native HTML5 video player with frame-accurate scrubbing
                 video_output = gr.Video(
-                    label=f"Output Video ({NUM_FRAMES} views, scrub freely)"
+                    label=f"Generated Video ({NUM_FRAMES} frames @ 16fps)"
                 )
-            with gr.Column():
-                # Frame slider for precise per-frame inspection
+            with gr.Column(scale=1):
+                # Frame-by-frame viewer for detailed inspection
                 frame_idx = gr.Slider(
-                    label="Frame Index",
+                    label="Frame Inspector",
                     minimum=0,
                     maximum=NUM_FRAMES - 1,
                     step=1,
@@ -243,28 +235,38 @@ def build_app(checkpoint_path: str, config_path: str) -> gr.Blocks:
                     interactive=True,
                 )
                 frame_display = gr.Image(
-                    label=f"Frame View (0–{NUM_FRAMES - 1})", type="numpy"
+                    label="Frame Detail", type="numpy", interactive=False
                 )
 
+        # State for storing results between interactions
         frames_state = gr.State([])
         ckpt_state = gr.State(checkpoint_path)
         config_state = gr.State(config_path)
 
-        def on_generate(xray_image, cfg, steps, ckpt, cfg_path):
-            status_msg, frames = generate_views_ui(
-                xray_image, cfg, steps, ckpt, cfg_path
+        # Define event handler for video generation
+        def on_generate(xray_image, cfg, steps, ckpt_path, cfg_path):
+            """Generate video and prepare outputs."""
+            status_msg, frames = generate_video(
+                xray_image=xray_image,
+                cfg=cfg,
+                steps=steps, 
+                ckpt_path=ckpt_path, 
+                cfg_path=cfg_path
             )
+
             first_frame = (
                 frames[0] if frames else np.zeros((256, 256, 3), dtype=np.uint8)
             )
-            video_path = _save_video(frames) if frames else None
-            # Return gr.update(value=0) to reset slider and prevent None-payload error
+            video_path = save_video(frames) if frames else None
+
             return status_msg, frames, gr.update(value=0), first_frame, video_path
 
         def on_frame_change(frames, idx):
+            """Update frame display when slider changes."""
             if not frames or idx is None:
                 return np.zeros((256, 256, 3), dtype=np.uint8)
-            return _frames_to_image(frames, int(idx))
+            
+            return frames_to_image(frames, int(idx))
 
         run_btn.click(
             fn=on_generate,
@@ -282,7 +284,8 @@ def build_app(checkpoint_path: str, config_path: str) -> gr.Blocks:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Cosmos Predict 2.5 X-Ray demo")
+    parser = argparse.ArgumentParser(description="Cosmos Predict 2.5 X-Ray Demo")
+    
     parser.add_argument(
         "--checkpoint-path",
         type=str,
@@ -298,17 +301,26 @@ if __name__ == "__main__":
     parser.add_argument("--server-name", type=str, default="0.0.0.0")
     parser.add_argument("--server-port", type=int, default=7860)
     parser.add_argument("--share", action="store_true")
+
+    # Parse command-line arguments
     args = parser.parse_args()
 
+    # Validate checkpoint path
     ckpt = Path(args.checkpoint_path)
     if not ckpt.exists():
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint_path}")
 
+    # If config path not provided, assume it's in the same directory as the checkpoint with name "config.json"
     cfg_path = args.config_path
     if cfg_path is None:
         cfg_path = str(ckpt.parent / "config.json")
 
+    # Build the Gradio app
     app = build_app(checkpoint_path=str(ckpt), config_path=cfg_path)
+
+    # Launch the Gradio app
     app.launch(
-        server_name=args.server_name, server_port=args.server_port, share=args.share
+        server_name=args.server_name, 
+        server_port=args.server_port, 
+        share=args.share
     )
