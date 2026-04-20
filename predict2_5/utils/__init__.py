@@ -33,6 +33,11 @@ from predict2_5.utils.io import (
 from predict2_5.utils.torch_utils import (
     fix_rope_buffers,
     move_tokenizer_to_device,
+    safe_torch_load,
+)
+
+from predict2_5.utils.validation import (
+    is_uuid_format,
 )
 
 __all__ = [
@@ -56,4 +61,6 @@ __all__ = [
     "save_vol_as_nifti",
     "fix_rope_buffers",
     "move_tokenizer_to_device",
+    "safe_torch_load",
+    "is_uuid_format",
 ]

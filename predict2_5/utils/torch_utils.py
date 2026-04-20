@@ -1,6 +1,33 @@
 """PyTorch utilities."""
 
 import torch
+from predict2_5.utils.logging import get_logger
+
+
+# --- Logger --- #
+logger = get_logger(__name__)
+
+
+def safe_torch_load(path: str, map_location: str = "cpu") -> dict:
+    """
+    Load checkpoint safely.
+
+    Args:
+        path: Path to checkpoint file.
+        map_location: Device mapping for torch.load.
+
+    Returns:
+        Loaded checkpoint object.
+    """
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    
+    except Exception as exc:
+        if "weights_only" in str(exc) or "Unsupported global" in str(exc):
+            logger.warning("weights_only=True failed; retry with weights_only=False")
+            return torch.load(path, map_location=map_location, weights_only=False)
+        
+        raise
 
 
 def fix_rope_buffers(module: torch.nn.Module) -> None:

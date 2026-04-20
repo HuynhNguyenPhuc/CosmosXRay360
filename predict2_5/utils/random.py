@@ -12,7 +12,7 @@ def arch_invariant_rand(
     seed: int | None = None,
 ) -> torch.Tensor:
     """
-    Generate random tensor with architecture-invariant properties.
+    Sample a random tensor from a Gaussian distribution N(0, I).
 
     Args:
         shape: Desired shape of the output tensor.
@@ -24,10 +24,9 @@ def arch_invariant_rand(
         Random tensor of specified shape, dtype, and device.
     """
     # Mersenne Twister pseudo-random number generator
-    
     rng = np.random.RandomState(seed)
 
-    # Draw samplses from a standard normal distribution
+    # Draw samples from a standard normal distribution
     random_array = rng.standard_normal(shape).astype(np.float32)
 
     return torch.from_numpy(random_array).to(dtype=dtype, device=device)

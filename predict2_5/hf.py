@@ -83,6 +83,42 @@ def upload_artifacts(
 # HuggingFace Download
 # ============================================================
 
+def resolve_hf_uri(hf_uri: str) -> tuple[str, str, str]:
+    """
+    Resolve HuggingFace URI into components.
+
+    Supported format:
+        hf://org/repo/path/to/file@revision
+
+    Revision is optional and defaults to "main".
+
+    Args:
+        hf_uri: HuggingFace URI.
+
+    Returns:
+        Tuple of (repo_id, filename, revision).
+    """
+    # Remove "hf://" prefix
+    spec = hf_uri[len("hf://") :]
+
+    # Split off revision if present (indicated by '@')
+    if "@" in spec:
+        path_part, revision = spec.rsplit("@", 1)
+    else:
+        path_part, revision = spec, "main"
+
+    # Split path part into repo_id and filename
+    parts = path_part.split("/")
+    if len(parts) < 3:
+        raise ValueError("HuggingFace URI must be hf://<org>/<repo>/<file>[ @revision ]")
+
+    # Repo ID is the first two parts, filename is the rest
+    repo_id = f"{parts[0]}/{parts[1]}"
+    filename = "/".join(parts[2:])
+
+    return repo_id, filename, revision
+
+
 def resolve_hf_token() -> str:
     """
     Resolve HuggingFace authentication token.
