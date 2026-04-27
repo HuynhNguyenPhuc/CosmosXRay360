@@ -25,9 +25,9 @@ logger = get_logger(__name__)
 def upload_artifacts(
     repo_id: str,
     local_paths: list[str],
-    path_in_repo_prefix: str = "",
-    private: bool = True,
-    create_repo_if_missing: bool = True,
+    remote_prefix: str = "",
+    visibility: str = "private",
+    ensure_repo: bool = True,
 ) -> list[str]:
     """
     Upload local files to HuggingFace Hub repository.
@@ -35,9 +35,9 @@ def upload_artifacts(
     Args:
         repo_id (str): The HuggingFace repository ID (e.g., "username/repo_name").
         local_paths (list[str]): List of local file paths to upload.
-        path_in_repo_prefix (str, optional): Prefix path in the repository. Defaults to "".
-        private (bool, optional): Whether the repository is private. Defaults to True.
-        create_repo_if_missing (bool, optional): Whether to create the repository if it doesn't exist. Defaults to True.
+        remote_prefix (str, optional): Prefix path in the repository. Defaults to "".
+        visibility (str, optional): Repository visibility, either "private" or "public". Defaults to "private".
+        ensure_repo (bool, optional): Whether to create the repository if it doesn't exist. Defaults to True.
     Returns:
         list[str]: List of uploaded file paths in the repository.
     """
@@ -52,8 +52,12 @@ def upload_artifacts(
     api = HfApi(token=token)
 
     # Create repository if it doesn't exist
-    if create_repo_if_missing:
-        api.create_repo(repo_id=repo_id, private=private, exist_ok=True)
+    if ensure_repo:
+        api.create_repo(
+            repo_id=repo_id, 
+            private=(visibility == "private"), 
+            exist_ok=True
+        )
 
     uploaded_paths: list[str] = []
     for local_path in local_paths:
@@ -61,7 +65,7 @@ def upload_artifacts(
         if not src.exists() or not src.is_file():
             raise FileNotFoundError(f"Upload source not found or not file: {src}")
 
-        dst_name = src.name if not path_in_repo_prefix else f"{path_in_repo_prefix.rstrip('/')}/{src.name}"
+        dst_name = src.name if not remote_prefix else f"{remote_prefix.rstrip('/')}/{src.name}"
         logger.info(f"Uploading: {src} -> {dst_name}")
 
         # Use API to upload file (handles large files and retries)
