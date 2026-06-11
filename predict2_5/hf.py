@@ -236,6 +236,29 @@ def hf_download(
         revision (str): The git revision (branch, tag, or commit) to download from.
         override_dest (str): Optional path to save the downloaded file. If None, uses HF cache.
     """
+    # Resolve authentication token first
+    token = resolve_hf_token()
+
+    is_large_file = any(filename.endswith(ext) for ext in [".pth", ".ckpt", ".safetensors", ".bin", ".pt"])
+    
+    # Try using robust standard hf_hub_download first for non-large files
+    if not is_large_file:
+        try:
+            resolved_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                revision=revision,
+                token=token or None,
+            )
+            if override_dest is not None:
+                dest = Path(override_dest)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(resolved_path, dest)
+                return str(dest)
+            return resolved_path
+        except Exception as e:
+            logger.warning(f"hf_hub_download failed for non-large file {filename}, falling back to curl: {e}")
+
     # Fast path: already in local HF cache
     if override_dest is None:
         try:
@@ -264,13 +287,12 @@ def hf_download(
         cache_dir.mkdir(parents=True, exist_ok=True)
         dest = cache_dir / Path(filename).name
 
+    min_size = 1_000_000 if is_large_file else 0
+
     # Skip if already downloaded
-    if dest.exists() and dest.stat().st_size > 1_000_000:
+    if dest.exists() and dest.stat().st_size > min_size:
         logger.info(f"Reusing: {dest}")
         return str(dest)
-
-    # Resolve authentication token
-    token = resolve_hf_token()
 
     # Acquire a file lock to ensure only one process downloads at a time
     lock_manager = _get_lock_manager()
@@ -278,7 +300,7 @@ def hf_download(
     
     with lock_manager(str(lock_path)):
         # Re-check after acquiring lock (another process may have downloaded)
-        if dest.exists() and dest.stat().st_size > 1_000_000:
+        if dest.exists() and dest.stat().st_size > min_size:
             logger.info(f"Already downloaded: {dest}")
             return str(dest)
 
@@ -289,7 +311,7 @@ def hf_download(
             curl_download(url, dest, token, attempt)
 
             # Check if download was successful
-            if dest.exists() and dest.stat().st_size > 1_000_000:
+            if dest.exists() and dest.stat().st_size > min_size:
                 size_gb = dest.stat().st_size / 1e9
                 logger.info(f"Download complete: {dest} ({size_gb:.2f} GB)")
                 return str(dest)

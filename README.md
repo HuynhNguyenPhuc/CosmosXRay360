@@ -32,7 +32,13 @@ cd CosmosXRay360
 uv venv .venv --python 3.10
 source .venv/bin/activate
 
+# Install project dependencies
 uv pip install -r requirements.txt
+
+# Install cosmos-predict2.5 with CUDA extra (cu128 for CUDA 12.x, cu130 for CUDA 13.x)
+cd cosmos-predict2.5
+uv pip install -e ".[cu128]"
+cd ..
 
 python app.py --checkpoint-path "hf://phuchuynh0904/CosmosXRay360/net_ema.pth" --share
 ```

@@ -489,18 +489,40 @@ if __name__ == "__main__":
     # Parse command-line arguments
     args = parser.parse_args()
 
-    # Validate checkpoint path
-    ckpt = Path(args.checkpoint_path)
-    if not ckpt.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint_path}")
-
-    # If config path not provided, assume it's in the same directory as the checkpoint with name "config.json"
+    checkpoint_path = args.checkpoint_path
     cfg_path = args.config_path
-    if cfg_path is None:
-        cfg_path = str(ckpt.parent / "config.json")
+
+    if checkpoint_path.startswith("hf://"):
+        # If config path not provided, assume it's in the same repository under "config.json"
+        if cfg_path is None:
+            if "@" in checkpoint_path:
+                uri_part, revision_part = checkpoint_path.rsplit("@", 1)
+                suffix = f"@{revision_part}"
+            else:
+                uri_part, suffix = checkpoint_path, ""
+            
+            if "/" in uri_part:
+                prefix, _ = uri_part.rsplit("/", 1)
+                cfg_path = f"{prefix}/config.json{suffix}"
+            else:
+                raise ValueError(f"Invalid Hugging Face URI: {checkpoint_path}")
+        ckpt_str = checkpoint_path
+    else:
+        ckpt = Path(checkpoint_path)
+        if not ckpt.exists():
+            from predict2_5.utils import is_uuid_format
+            if not is_uuid_format(checkpoint_path):
+                raise FileNotFoundError(f"Checkpoint not found locally and is not a valid Hugging Face URI or Cosmos UUID: {checkpoint_path}")
+        
+        if cfg_path is None:
+            if ckpt.exists():
+                cfg_path = str(ckpt.parent / "config.json")
+            else:
+                cfg_path = None
+        ckpt_str = str(ckpt) if ckpt.exists() else checkpoint_path
 
     # Build the Gradio app
-    app = build_app(checkpoint_path=str(ckpt), config_path=cfg_path)
+    app = build_app(checkpoint_path=ckpt_str, config_path=cfg_path)
 
     # Launch the Gradio app
     app.launch(
