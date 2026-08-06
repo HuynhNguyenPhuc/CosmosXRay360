@@ -25,6 +25,7 @@ einops==0.8.1
 gdown
 rich
 click
+opencv-python-headless
 
 # === Cosmos-Predict2.5 ===
 megatron-core==0.10.0
@@ -35,6 +36,9 @@ transformers==4.51.3
 tensorboard
 wandb
 gradio>=4.44.0
+
+# === Evaluation Metrics ===
+lpips
 
 # === Cloud Storage ===
 google-cloud-storage

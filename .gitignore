@@ -3,13 +3,6 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-data/*
-processed_data/*
-cache
-checkpoints
-lightning_logs
-t5_xxl
-
 # C extensions
 *.so
 
@@ -105,6 +98,19 @@ ipython_config.py
 #   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
 #   This is especially recommended for binary packages to ensure reproducibility, and is more
 #   commonly ignored for libraries.
+
+# Datasets and checkpoints
+# NOTE: datasets/ holds bulk data (raw volumes, pre-rendered projections, HF
+# cache) but also real source files (pre_render_diffdrr.py, the fixed
+# cross-dataset split json) that must stay tracked - see the `!datasets/...`
+# exceptions below. A bare `datasets/` entry here would block those
+# exceptions entirely (git can't re-include files under an excluded
+# directory), so exclusion is done via `datasets/*` further down instead.
+baselines/checkpoints/
+eval_outputs/
+arxiv_cache/
+arxiv_papers/
+.venv/
 #uv.lock
 
 # poetry
@@ -203,4 +209,29 @@ cython_debug/
 # VSCode
 .vscode
 
-cosmedcosmos-predict2.5/
+# Data
+data/*
+datasets/*
+!datasets/pre_render_diffdrr.py
+!datasets/cross_dataset_split.json
+docs/reviews/*
+arxiv_*/*
+
+# Cache
+cache/
+*_cache/
+t5_xxl/
+
+# Checkpoints
+checkpoints
+
+# Lightning logs
+lightning_logs
+
+# Coding Agent
+AGENTS.md
+CLAUDE*.md
+.claude*
+.crush
+.github
+*-mcp.json

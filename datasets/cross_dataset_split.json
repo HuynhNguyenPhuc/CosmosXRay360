@@ -1,0 +1,9 @@
+{
+  "train": [
+    {"dataset": "TCIA", "cases": 771},
+    {"dataset": "MELA2022", "cases": 525}
+  ],
+  "test": [
+    {"dataset": "NSCLC", "cases": 402}
+  ]
+}
