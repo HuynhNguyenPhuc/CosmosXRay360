@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.errors import HfHubHTTPError
 
-MAX_RATE_LIMIT_RETRIES = 6
+MAX_RATE_LIMIT_RETRIES = 10
 
 def download_file(repo_id, filename, repo_type, local_dir):
     # Check if already downloaded
@@ -24,7 +24,14 @@ def download_file(repo_id, filename, repo_type, local_dir):
     # Multiple training VMs share one HF account/token, so a 429 here usually
     # means the *account's* 5-minute quota is briefly exhausted, not that this
     # particular file is unavailable - retry with backoff instead of giving up.
+    # Raised from 6 retries/60s cap to 10/120s (2026-08-06): 3 parallel worker VMs
+    # sharing one token still exhausted the old budget (12-18% of files failed
+    # across a real 3-worker launch) even with staggered starts and lower
+    # per-VM concurrency (see launch_parallel_vms.sh) -- the shared quota's
+    # window is a few minutes wide, so the retry budget needs to be able to
+    # outlast it, not just back off briefly.
     for attempt in range(MAX_RATE_LIMIT_RETRIES):
+        is_last_attempt = attempt == MAX_RATE_LIMIT_RETRIES - 1
         try:
             hf_hub_download(
                 repo_id=repo_id,
@@ -36,13 +43,29 @@ def download_file(repo_id, filename, repo_type, local_dir):
             return filename, "downloaded"
         except HfHubHTTPError as e:
             status = e.response.status_code if e.response is not None else None
-            is_last_attempt = attempt == MAX_RATE_LIMIT_RETRIES - 1
-            if status == 429 and not is_last_attempt:
-                wait_s = min(60, 2**attempt) + random.uniform(0, 1)
+            # 429 (rate limit) and 5xx (transient server/gateway errors -- a
+            # real 504 was observed from a cross-region worker, see below) are
+            # worth retrying; anything else (404 Not Found, etc.) is a
+            # permanent failure and retrying just wastes the budget.
+            if status is not None and (status == 429 or 500 <= status < 600) and not is_last_attempt:
+                wait_s = min(120, 2**attempt) + random.uniform(0, 1)
                 time.sleep(wait_s)
                 continue
             return filename, f"failed: {e}"
         except Exception as e:
+            # Network-layer failures (read timeouts, connection resets) that
+            # never reach an HTTP status code at all -- exactly as transient as
+            # a 5xx, but this branch used to give up immediately with zero
+            # retries from this script's own loop (only huggingface_hub's own
+            # internal retry applied, a separate and much shorter budget).
+            # Found 2026-08-06: cosmos-worker-1, forced into europe-west1-b by
+            # a US-wide L4 GPU stockout, hit repeated ReadTimeoutErrors against
+            # huggingface.co that were failing files outright instead of
+            # retrying, purely because of the added cross-region latency.
+            if not is_last_attempt:
+                wait_s = min(120, 2**attempt) + random.uniform(0, 1)
+                time.sleep(wait_s)
+                continue
             return filename, f"failed: {e}"
     return filename, "failed: exhausted rate-limit retries"
 

@@ -9,6 +9,7 @@ import copy
 import logging
 import os
 import sys
+import traceback
 import warnings
 
 try:
@@ -43,11 +44,7 @@ from models.utils import normalize_tensor
 # --- Logger --- #
 logger = logging.getLogger(__name__)
 
-# lpips.PerceptualLoss loads and initializes a full AlexNet from disk on every
-# construction. fit_latent_and_weights is called once per patient (hundreds to
-# thousands of times per training epoch or evaluation run within the same
-# process), so a fresh instance per call was silently dominating per-patient
-# wall-clock time -- cache it process-wide and build it once instead.
+# Cached process-wide LPIPS loss instance
 _PERCEPT_LOSS: "torch.nn.Module | None" = None
 
 
@@ -68,62 +65,42 @@ def fit_latent_and_weights(
     theta_mean: float,
     device: str,
     iterations: int = 500,
+    use_amp: bool = False,
 ) -> tuple["torch.Tensor", float]:
-    """Jointly optimizes a latent code z and the generator's own weights to
-    reconstruct a single reference X-ray, matching ``render_xray_G_Z.py``'s
-    per-patient test-time fitting procedure (the only training signal this
-    single-frontal-view-conditioned method has -- see module docstring in
-    ``train/mednerf.py`` for why the population-level adversarial GAN
-    pretraining from ``graf-main/train.py`` isn't reused here).
-
-    The reference repo actually has two variants: ``render_xray_G.py`` optimizes
-    only the generator's weights (z is sampled once and held fixed, no gradient),
-    while ``render_xray_G_Z.py`` jointly optimizes z and the generator, with an
-    added Gaussian-prior NLL regularizer on z. This wrapper jointly fits both, so
-    it follows ``render_xray_G_Z.py``'s algorithm and hyperparameters exactly.
+    """Jointly optimizes latent code z and generator weights to reconstruct target X-ray.
 
     Args:
-        generator_test: Generator replica with active parameter tracking
-            (``.parameters``/``.named_parameters`` monkey-patched to the
-            instance's own ``_parameters``/``_named_parameters``, as done by
-            the reference implementation).
-        target_xr: Reference X-ray tensor to reconstruct, shape [H, W] or [1, H, W].
-        z_dim: Latent code dimensionality (``config["z_dist"]["dim"]``).
-        img_size: Render resolution (``config["data"]["imsize"]``).
-        radius: Camera distance (``config["data"]["hwfr"][3]``).
-        theta_mean: Mean polar/elevation angle of the trained pose distribution, in
-            degrees (see ``to_theta`` usage at call sites) -- NOT 0, which is the
-            poles of the sphere, a pose never seen during MedNeRF training.
+        generator_test: Generator model instance.
+        target_xr: Target X-ray tensor, shape [H, W] or [1, H, W].
+        z_dim: Latent code dimension.
+        img_size: Render resolution.
+        radius: Camera distance.
+        theta_mean: Mean polar elevation angle in degrees.
         device: Compute device.
-        iterations: Number of joint z/generator optimization steps.
+        iterations: Number of optimization steps.
+        use_amp: If True, uses torch.autocast for mixed precision.
 
     Returns:
-        A tuple of (optimized latent tensor z of shape [1, z_dim], final reconstruction loss).
+        Tuple of (optimized latent z [1, z_dim], final reconstruction loss).
     """
     z = torch.randn(1, z_dim, device=device, requires_grad=True)
 
     percept = _get_perceptual_loss(device)
 
-    # lr=0.0005, betas=(0., 0.999) match the reference render_xray_G_Z.py's hardcoded
-    # z_optim exactly (graf-main/render_xray_G_Z.py:158) -- was Adam(lr=0.01) with
-    # default betas here, which changes both step size and momentum behavior.
     z_optim = optim.Adam([z], lr=0.0005, betas=(0.0, 0.999))
-    # lr=0.0005 matches the reference render_xray_G_Z.py's hardcoded g_optim exactly
-    # (graf-main/render_xray_G_Z.py:103).
     g_optim = optim.RMSprop(generator_test.parameters(), lr=0.0005, alpha=0.99, eps=1e-8)
 
-    # Frontal pose for the input XR
+    # Frontal pose for input X-ray
     pose = get_render_poses(radius=radius, angle_range=(0, 0), theta=theta_mean, N=1)
     pose = pose[0].to(device)
     rays = generator_test.val_ray_sampler(
         img_size, img_size, generator_test.focal, pose
     )[0].unsqueeze(0)
 
-    # We need to reshape rays to the format generator expects during optimization
-    rays = rays.permute(1, 0, 2, 3).flatten(1, 2)  # 2x(BxHxW)x3
+    # Reshape rays to generator format
+    rays = rays.permute(1, 0, 2, 3).flatten(1, 2)
 
-    # Resize target to img_size, normalizing to 4D [B, C, H, W] regardless of whether
-    # the caller passed [H, W], [1, H, W], or [1, 1, H, W].
+    # Resize target to img_size and 4D format [B, C, H, W]
     target_xr_4d = target_xr
     while target_xr_4d.dim() < 4:
         target_xr_4d = target_xr_4d.unsqueeze(0)
@@ -135,63 +112,61 @@ def fit_latent_and_weights(
     if target_xr_resized.shape[1] == 1:
         target_xr_resized = target_xr_resized.repeat(1, 3, 1, 1)
 
-    # Normalize target from [0, 1] to [-1, 1] to match MedNeRF generator's output range [-1, 1]
+    # Normalize target to [-1, 1] range
     target_xr_resized = target_xr_resized * 2.0 - 1.0
 
     logger.info(f"[MedNeRF] Optimizing latent code for {iterations} iterations...")
     generator_test.train()
-    generator_test.chunk = 4096  # Use safe chunk size during backward pass optimization
+    generator_test.chunk = 4096
     rec_loss = torch.tensor(0.0)
+    scaler = torch.amp.GradScaler(enabled=(use_amp and device.startswith("cuda")))
+    autocast_device = "cuda" if device.startswith("cuda") else "cpu"
     for _ in range(iterations):
         z_optim.zero_grad()
         g_optim.zero_grad()
 
-        outputs = generator_test(z, rays=rays)
-        rgb = outputs[0] if isinstance(outputs, tuple) else outputs
+        with torch.autocast(device_type=autocast_device, enabled=use_amp):
+            outputs = generator_test(z, rays=rays)
+            rgb = outputs[0] if isinstance(outputs, tuple) else outputs
 
-        # Reshape rgb to image format
-        if rgb.shape[0] != img_size * img_size:
-            dim_h = int(np.sqrt(rgb.shape[0]))
-            rgb = rgb.view(1, dim_h, dim_h, -1).permute(0, 3, 1, 2)
-            rgb = F.interpolate(rgb, size=(img_size, img_size), mode="bilinear", align_corners=True)
-        else:
-            rgb = rgb.view(1, img_size, img_size, -1).permute(0, 3, 1, 2)
+            # Reshape rgb to image format
+            if rgb.shape[0] != img_size * img_size:
+                dim_h = int(np.sqrt(rgb.shape[0]))
+                rgb = rgb.view(1, dim_h, dim_h, -1).permute(0, 3, 1, 2)
+                rgb = F.interpolate(rgb, size=(img_size, img_size), mode="bilinear", align_corners=True)
+            else:
+                rgb = rgb.view(1, img_size, img_size, -1).permute(0, 3, 1, 2)
 
-        if rgb.shape[1] == 4:
-            rgb = rgb[:, :3]
-        elif rgb.shape[1] == 1:
-            rgb = rgb.repeat(1, 3, 1, 1)
+            if rgb.shape[1] == 4:
+                rgb = rgb[:, :3]
+            elif rgb.shape[1] == 1:
+                rgb = rgb.repeat(1, 3, 1, 1)
 
-        # 0.3 * nll matches render_xray_G_Z.py's Gaussian-prior regularizer on z
-        # (graf-main/render_xray_G_Z.py:179-183) -- without it, z is free to drift
-        # arbitrarily far from the standard-normal prior the generator was trained
-        # under, in exchange for a marginally better reconstruction.
-        nll = (z ** 2 / 2).mean()
-        rec_loss = (
-            0.3 * percept(rgb, target_xr_resized).sum()
-            + 0.1 * F.mse_loss(rgb, target_xr_resized)
-            + 0.3 * nll
-        )
-        rec_loss.backward()
-        z_optim.step()
-        g_optim.step()
+            # Standard-normal prior regularization on z
+            nll = (z ** 2 / 2).mean()
+            rec_loss = (
+                0.3 * percept(rgb, target_xr_resized).sum()
+                + 0.1 * F.mse_loss(rgb, target_xr_resized)
+                + 0.3 * nll
+            )
+        scaler.scale(rec_loss).backward()
+        scaler.step(z_optim)
+        scaler.step(g_optim)
+        scaler.update()
 
     generator_test.eval()
     return z, rec_loss.item()
 
 
 class MedNeRFWrapper:
-    """Wrapper for MedNeRF baseline from cloned/mednerf."""
+    """Wrapper for MedNeRF baseline."""
     
     def __init__(self, checkpoint_path: str | None = None, iterations: int = 50) -> None:
-        """Initializes and builds the MedNeRF generator implicit coordinate network.
+        """Initializes the MedNeRF generator.
 
         Args:
             checkpoint_path: Optional path to pre-trained weights file.
-            iterations: Per-patient latent+weight fitting steps run in
-                ``infer_multi_views`` (reference ``render_xray_G.py`` uses
-                5000; this default is a cheaper stand-in -- see
-                ``scripts/launch_parallel_vms.sh`` for the cost rationale).
+            iterations: Per-patient latent/weight fitting steps.
         """
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = None
@@ -254,17 +229,15 @@ class MedNeRFWrapper:
         azimuths: tuple[float, float, int] = (0, 360, 93),
         iterations: int | None = None,
     ) -> list[torch.Tensor]:
-        """Queries the MedNeRF model to synthesize novel views over specified angles.
+        """Optimizes generator weights for input X-ray and renders novel views.
 
         Args:
             input_xr: Input 2D projection CXR [1, 1, 256, 256].
             azimuths: Target view boundaries as (start_angle, end_angle, N_views).
-            iterations: Per-call override for the fitting budget (defaults to
-                ``self.iterations``); lets a single loaded wrapper be swept
-                across budgets without reloading the checkpoint/LPIPS.
+            iterations: Optional fitting iteration override.
 
         Returns:
-            A list of N synthesized 2D novel-view radiography tensors.
+            List of N synthesized 2D novel-view radiography tensors.
         """
         if self.model is None or self.config is None:
             return []
@@ -346,6 +319,6 @@ class MedNeRFWrapper:
             torch.cuda.empty_cache()
             
         except Exception as e:
-            import traceback; traceback.print_exc()
+            traceback.print_exc()
         
         return results

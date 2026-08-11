@@ -230,6 +230,7 @@ lightning_logs
 
 # Coding Agent
 AGENTS.md
+QWEN.md
 CLAUDE*.md
 .claude*
 .crush

@@ -2,14 +2,17 @@
 # =====================================================================
 # CosmosXRay360: GCP Parallel Worker Deployment & Baseline Training
 # =====================================================================
-# Spawns 3 isolated L4 GPU VMs on GCP, each running a paired baseline workload
-# inside a Docker container. Automatically shuts down each VM upon completion
-# to eliminate idle compute costs.
+# Spawns GPU VMs on GCP running baseline workloads inside Docker containers.
+# Automatically shuts down each VM upon completion.
 #
-# Pairing Strategy (Heavy + Light / Medium + Medium):
-#   - Worker 1 (cosmos-worker-1): Dx2CT (Heavy)    + NAF (Light)
-#   - Worker 2 (cosmos-worker-2): SV-DRR (Heavy)   + XRaySyn (Light)
-#   - Worker 3 (cosmos-worker-3): PixelNeRF (Med)  + MedNeRF (Med)
+# Default Worker Pairing:
+#   - Worker 1 (cosmos-worker-1): Dx2CT + NAF
+#   - Worker 2 (cosmos-worker-2): XRaySyn only (SV-DRR now lives on worker-4's
+#     dedicated A100 below -- worker-2 no longer pairs the two)
+#   - Worker 3 (cosmos-worker-3): PixelNeRF + MedNeRF
+#   - Worker 4 (cosmos-worker-4): SV-DRR only (dedicated A100 slot -- needs a
+#     larger --batch_size/--accum_steps via --extra-args than the L4 default)
+#   - Worker 5 (cosmos-worker-5): PixelNeRF + MedNeRF (second slot)
 # =====================================================================
 
 set -e
@@ -21,49 +24,29 @@ TEMPLATE_FILE="template.json"
 GCS_BUCKET="graphicsminer-data-science-bucket"
 DRY_RUN=false
 
-# Per-baseline epoch counts -- deliberately NOT uniform. Each value below is
-# grounded in the ORIGINAL reference implementation under baselines/cloned/
-# (paper-cited defaults, documented README training recipes, or the exact
-# config/literal a real invocation uses -- not just an unused argparse
-# fallback default; see docs/baselines/ history for the full per-baseline
-# audit trail) and cross-checked against our own measured wall-clock cost:
-#   - dx2ct: cloned/DX2CT/train.py cites "Paper default: 80" epochs directly.
-#     Measured ~1 min/epoch here, so 80 epochs (~80 min) is cheap and faithful.
-#   - xraysyn: no train.py ships in cloned/XraySyn at all (inference-only
-#     release) -- num_epoch: 100 comes from train_opts.yaml, a metadata
-#     snapshot bundled with the released checkpoint. Medium confidence (it's
-#     a record, not something we can re-run), but the best evidence available.
-#   - svdrr: cloned/SV-DRR/README.md's real recipe is 200,000 steps at batch
-#     size 64 (num_train_epochs=1 is a dead default overridden by
-#     --max_train_steps in every real invocation) -- utterly infeasible to
-#     replicate at our ~1000-patient, batch-size-1 scale, so this value is a
-#     pragmatic compromise, not a literal match. Our LR (5e-6) already
-#     matches the README recipe exactly.
-#   - pixelnerf: cloned/pixel-nerf/src/util/args.py's default_num_epochs is a
-#     10,000,000 sentinel, and conf/exp/dtu.conf's num_epoch_repeats=32 is a
-#     per-epoch data-repeat multiplier, not a total budget -- there is
-#     genuinely no fixed target to match. Measured ~14 min/epoch here.
-#   - naf: README's exact invocation (`python train.py --config
-#     chest_50.yaml`) uses epoch: 3000, but that's PER-SCAN FITTING
-#     ITERATIONS (maps to our --iters_per_sample=200, not this --epochs), and
-#     the original has no notion of our "sweep all patients" epoch at all.
-#     Measured ~5h44m per our outer epoch already; even 1 validates the path.
-#   - mednerf: same story -- render_xray_G.py hardcodes 5000 iterations/patient
-#     (maps to --iters_per_sample=50 here, not this --epochs). Measured ~11h
-#     per our outer epoch pre-LPIPS-fix.
-# NOTE: for naf/mednerf, --iters_per_sample (200/50) is itself far below the
-# reference (3000/5000) -- deliberately NOT bumped to match, since doing so
-# would multiply their already-multi-hour epoch cost by 15x/100x respectively
-# (~86h and ~1100h per epoch). That's a wall-clock/cost decision, not a config
-# correctness fix, so it's left as an explicit flagged tradeoff rather than
-# applied silently.
+# Concurrency & stagger settings to prevent HuggingFace rate-limiting
+DOWNLOAD_MAX_WORKERS=6
+DOWNLOAD_STAGGER_SECONDS=180   # 3 min between worker starts
+
+# Default epoch count per baseline
 declare -A BASELINE_EPOCHS=(
     [dx2ct]=80
     [pixelnerf]=8
-    [svdrr]=6
+    [svdrr]=1316
     [xraysyn]=100
     [naf]=1
     [mednerf]=1
+)
+
+declare -A WORKER_OVERRIDE          # worker_name -> "baseline1[,baseline2]"
+declare -A ONLY_WORKERS             # worker_name -> 1 (filter launched workers)
+# Extra CLI args per baseline (appended after --epochs)
+declare -A BASELINE_EXTRA_ARGS=(
+    [svdrr]="--patience 50 --batch_size 4 --accum_steps 16"
+)
+# Instance template per worker (default: L4 template; worker-4 defaults to dedicated A100 template)
+declare -A WORKER_TEMPLATE_OVERRIDE=(
+    [cosmos-worker-4]="cosmosxray360-a100-trainer-template"
 )
 
 usage() {
@@ -74,6 +57,21 @@ usage() {
     echo "                          e.g. --epochs naf=2 --epochs dx2ct=20"
     echo "  --zone ZONE             GCP zone to deploy workers (default: us-central1-a)"
     echo "  --bucket BUCKET         GCS bucket to store output checkpoints (default: $GCS_BUCKET)"
+    echo "  --only WORKER[,WORKER]  Only (re)launch these worker names, skip the rest entirely"
+    echo "                          (e.g. --only cosmos-worker-1,cosmos-worker-2)"
+    echo "  --override WORKER=BASELINE[,BASELINE2]"
+    echo "                          Replace a worker's default baseline pairing -- give one"
+    echo "                          baseline to run it alone (skips the second entirely), e.g."
+    echo "                          --override cosmos-worker-1=dx2ct to relaunch just Dx2CT"
+    echo "                          on worker-1 without redoing its already-finished NAF"
+    echo "  --extra-args BASELINE=\"ARGS\""
+    echo "                          Extra CLI args appended after --epochs for one baseline"
+    echo "                          (repeatable), e.g. --extra-args mednerf=\"--amp\""
+    echo "  --worker-template WORKER=TEMPLATE_NAME"
+    echo "                          Use a non-default instance template for one worker (repeatable)"
+    echo "                          -- the template must already exist (this script only"
+    echo "                          auto-registers the default L4 template), e.g."
+    echo "                          --worker-template cosmos-worker-4=cosmosxray360-a100-trainer-template"
     echo "  --dry-run               Print commands without executing GCP instance creation"
     echo "  --help                  Display this help message"
     echo ""
@@ -93,6 +91,25 @@ while [[ "$#" -gt 0 ]]; do
             shift ;;
         --zone) ZONE="$2"; shift ;;
         --bucket) GCS_BUCKET="$2"; shift ;;
+        --only)
+            IFS=',' read -ra ONLY_LIST <<< "$2"
+            for w in "${ONLY_LIST[@]}"; do ONLY_WORKERS[$w]=1; done
+            shift ;;
+        --override)
+            IFS='=' read -r OV_WORKER OV_BASELINES <<< "$2"
+            WORKER_OVERRIDE[$OV_WORKER]="$OV_BASELINES"
+            shift ;;
+        --extra-args)
+            IFS='=' read -r EA_BASELINE EA_ARGS <<< "$2"
+            if [ -z "${BASELINE_EPOCHS[$EA_BASELINE]:-}" ]; then
+                echo "❌ Error: unknown baseline '$EA_BASELINE' in --extra-args $2"; exit 1
+            fi
+            BASELINE_EXTRA_ARGS[$EA_BASELINE]="$EA_ARGS"
+            shift ;;
+        --worker-template)
+            IFS='=' read -r WT_WORKER WT_TEMPLATE <<< "$2"
+            WORKER_TEMPLATE_OVERRIDE[$WT_WORKER]="$WT_TEMPLATE"
+            shift ;;
         --dry-run) DRY_RUN=true ;;
         --help) usage ;;
         *) echo "Unknown parameter: $1"; usage ;;
@@ -100,10 +117,7 @@ while [[ "$#" -gt 0 ]]; do
     shift
 done
 
-# Resolve an HF token to forward into each worker's containers. Anonymous requests
-# from 3 VMs hitting the same dataset repo in parallel get 429 rate-limited by HF,
-# which silently starves the training dataset (and SV-DRR's HF fallback checkpoint
-# download) without ever raising a hard error - so this is required, not optional.
+# Resolve HF_TOKEN to forward into worker containers
 if [ -z "${HF_TOKEN:-}" ]; then
     HF_TOKEN="$(python3 -c 'from huggingface_hub.utils import get_token; import sys; t=get_token(); sys.exit(1) if not t else print(t)' 2>/dev/null || true)"
 fi
@@ -147,13 +161,33 @@ fi
 launch_worker() {
     local WORKER_NAME="$1"
     local BASELINE_1="$2"
-    local BASELINE_2="$3"
+    local BASELINE_2="$3"          # Optional second baseline
+    local STAGGER_SECONDS="${4:-0}" # Stagger delay before download
     local EPOCHS_1="${BASELINE_EPOCHS[$BASELINE_1]}"
-    local EPOCHS_2="${BASELINE_EPOCHS[$BASELINE_2]}"
+    local EXTRA_ARGS_1="${BASELINE_EXTRA_ARGS[$BASELINE_1]:-}"
+    local WORKER_TEMPLATE="${WORKER_TEMPLATE_OVERRIDE[$WORKER_NAME]:-$TEMPLATE_NAME}"
+
+    local WORKLOAD_DESC="$BASELINE_1 (epochs=$EPOCHS_1${EXTRA_ARGS_1:+ $EXTRA_ARGS_1})"
+    local BASELINE_2_SECTION=""
+    if [ -n "$BASELINE_2" ]; then
+        local EPOCHS_2="${BASELINE_EPOCHS[$BASELINE_2]}"
+        local EXTRA_ARGS_2="${BASELINE_EXTRA_ARGS[$BASELINE_2]:-}"
+        WORKLOAD_DESC="$WORKLOAD_DESC + $BASELINE_2 (epochs=$EPOCHS_2${EXTRA_ARGS_2:+ $EXTRA_ARGS_2})"
+        BASELINE_2_SECTION="
+# Execute assigned Baseline 2
+echo \"▶ Training Baseline 2: $BASELINE_2...\"
+docker run --gpus all --rm --ipc=host \\
+    -e HF_TOKEN=\"\$HF_TOKEN\" \\
+    -v \$(pwd)/datasets:/workspace/datasets \\
+    -v \$(pwd)/baselines/checkpoints:/workspace/baselines/checkpoints \\
+    cosmos_baselines \\
+    python3 baselines/train/${BASELINE_2}.py --epochs $EPOCHS_2 $EXTRA_ARGS_2
+"
+    fi
 
     echo ""
     echo "---------------------------------------------------------------------"
-    echo "📦 Deploying $WORKER_NAME -> Workload: [$BASELINE_1 (epochs=$EPOCHS_1) + $BASELINE_2 (epochs=$EPOCHS_2)]"
+    echo "📦 Deploying $WORKER_NAME (template: $WORKER_TEMPLATE) -> Workload: [$WORKLOAD_DESC]"
     echo "---------------------------------------------------------------------"
 
     # Startup script executed by VM upon boot
@@ -163,7 +197,7 @@ set -e
 exec > >(tee -a /var/log/cosmos_training.log) 2>&1
 
 echo "====================================================================="
-echo "🚀 STARTING WORKER $WORKER_NAME ($BASELINE_1 + $BASELINE_2)"
+echo "🚀 STARTING WORKER $WORKER_NAME ($WORKLOAD_DESC)"
 echo "====================================================================="
 
 # Install docker.io and configure nvidia runtime if docker is missing
@@ -193,61 +227,93 @@ docker build -t cosmos_baselines -f baselines/Dockerfile .
 # Prepare directories
 mkdir -p datasets baselines/checkpoints
 
-echo "▶ Downloading raw dataset volumes..."
-docker run --gpus all --rm \
-    -e HF_TOKEN="$HF_TOKEN" \
-    -v \$(pwd)/datasets:/workspace/datasets \
-    cosmos_baselines \
-    python3 scripts/fast_download.py --percentage 1.0
+if [ "$STAGGER_SECONDS" -gt 0 ]; then
+    echo "▶ Staggering download start by ${STAGGER_SECONDS}s..."
+    sleep "$STAGGER_SECONDS"
+fi
 
-# Pre-render downloaded CT volumes into the DiffDRR projections that
-# baselines/train/*.py actually reads (fast_download.py only fetches raw .nii.gz
-# volumes - skipping this step leaves datasets/pre_rendered/ empty and every
-# training script's DataLoader gets 0 samples).
-echo "▶ Pre-rendering DiffDRR projections..."
-docker run --gpus all --rm \
-    -v \$(pwd)/datasets:/workspace/datasets \
-    cosmos_baselines \
-    python3 datasets/pre_render_diffdrr.py
+# Check for pre-rendered dataset cache in GCS before raw download + render
+if gsutil -q ls "gs://$GCS_BUCKET/pre_rendered_cache/pre_rendered/train/" >/dev/null 2>&1; then
+    echo "▶ Found pre-rendered dataset cache in GCS -- downloading directly..."
+    gsutil -m cp -r "gs://$GCS_BUCKET/pre_rendered_cache/pre_rendered" datasets/
+else
+    echo "▶ No pre-rendered cache in GCS -- downloading raw dataset volumes..."
+    docker run --gpus all --rm --ipc=host \
+        -e HF_TOKEN="$HF_TOKEN" \
+        -v \$(pwd)/datasets:/workspace/datasets \
+        cosmos_baselines \
+        python3 scripts/fast_download.py --percentage 1.0 --max_workers $DOWNLOAD_MAX_WORKERS
+
+    echo "▶ Pre-rendering DiffDRR projections..."
+    docker run --gpus all --rm --ipc=host \
+        -v \$(pwd)/datasets:/workspace/datasets \
+        cosmos_baselines \
+        python3 datasets/pre_render_diffdrr.py
+
+    echo "▶ Seeding pre-rendered dataset cache in GCS for future workers..."
+    gsutil -m cp -r datasets/pre_rendered "gs://$GCS_BUCKET/pre_rendered_cache/" || true
+fi
+
+# Ensure raw 3D CT dataset volumes (TCIA & MELA2022) are present (needed by 3D volume tasks like Dx2CT)
+if [ ! -d "datasets/TCIA" ] || [ ! -d "datasets/MELA2022" ]; then
+    echo "▶ Downloading raw 3D CT dataset volumes (TCIA & MELA2022)..."
+    docker run --gpus all --rm --ipc=host \
+        -e HF_TOKEN="$HF_TOKEN" \
+        -v \$(pwd)/datasets:/workspace/datasets \
+        cosmos_baselines \
+        python3 scripts/fast_download.py --percentage 1.0 --max_workers $DOWNLOAD_MAX_WORKERS
+fi
 
 # Execute assigned Baseline 1
 echo "▶ Training Baseline 1: $BASELINE_1..."
-docker run --gpus all --rm \
+# --ipc=host shares host IPC namespace to prevent PyTorch DataLoader /dev/shm OOM
+docker run --gpus all --rm --ipc=host \
     -e HF_TOKEN="$HF_TOKEN" \
     -v \$(pwd)/datasets:/workspace/datasets \
     -v \$(pwd)/baselines/checkpoints:/workspace/baselines/checkpoints \
     cosmos_baselines \
-    python3 baselines/train/${BASELINE_1}.py --epochs $EPOCHS_1
+    python3 baselines/train/${BASELINE_1}.py --epochs $EPOCHS_1 $EXTRA_ARGS_1
 
-# Execute assigned Baseline 2
-echo "▶ Training Baseline 2: $BASELINE_2..."
-docker run --gpus all --rm \
-    -e HF_TOKEN="$HF_TOKEN" \
-    -v \$(pwd)/datasets:/workspace/datasets \
-    -v \$(pwd)/baselines/checkpoints:/workspace/baselines/checkpoints \
-    cosmos_baselines \
-    python3 baselines/train/${BASELINE_2}.py --epochs $EPOCHS_2
-
-# Sync checkpoints to GCS if gsutil/gcloud is configured
+$BASELINE_2_SECTION
+# Sync checkpoints to GCS if gsutil is available
 if command -v gsutil >/dev/null 2>&1; then
     echo "▶ Syncing checkpoints to gs://$GCS_BUCKET/checkpoints/$WORKER_NAME/..."
     gsutil -m cp -r baselines/checkpoints/* "gs://$GCS_BUCKET/checkpoints/$WORKER_NAME/" || true
 fi
 
-echo "✓ Workload completed ($BASELINE_1 + $BASELINE_2). Shutting down instance to save cost..."
+echo "✓ Workload completed ($WORKLOAD_DESC). Shutting down instance to save cost..."
 sudo shutdown -h now
 EOF
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY RUN] Would create VM: $WORKER_NAME in candidate zones"
     else
+        # Pass startup script via temp file to avoid gcloud comma-parsing issues
+        STARTUP_SCRIPT_FILE="$(mktemp)"
+        printf '%s' "$STARTUP_SCRIPT" > "$STARTUP_SCRIPT_FILE"
+
         # Candidate zones with L4 GPU availability to try in case of stockout
         CANDIDATE_ZONES=("us-east1-c" "us-west1-a" "us-east1-d" "us-east1-b" "us-west1-b" "us-west1-c" "us-central1-a" "us-central1-b" "us-central1-c" "europe-west1-b")
         LAUNCH_SUCCESS=false
 
+        # First check if the VM is already running in any candidate zone
+        for CAND_ZONE in "${CANDIDATE_ZONES[@]}"; do
+            VM_STATUS="$(gcloud compute instances describe "$WORKER_NAME" --zone="$CAND_ZONE" --project="$PROJECT_ID" --format="value(status)" 2>/dev/null || true)"
+            if [ "$VM_STATUS" = "RUNNING" ]; then
+                echo "✓ Instance $WORKER_NAME is already RUNNING in zone '$CAND_ZONE'. Skipping launch."
+                LAUNCH_SUCCESS=true
+                break
+            fi
+        done
+
+        if [ "$LAUNCH_SUCCESS" = true ]; then
+            rm -f "$STARTUP_SCRIPT_FILE"
+            return 0
+        fi
+
         for CAND_ZONE in "${CANDIDATE_ZONES[@]}"; do
             echo "Attempting launch for $WORKER_NAME in zone '$CAND_ZONE'..."
-            
+
             # Delete existing VM in this zone if present
             if gcloud compute instances describe "$WORKER_NAME" --zone="$CAND_ZONE" --project="$PROJECT_ID" >/dev/null 2>&1; then
                 echo "Deleting existing instance $WORKER_NAME in zone $CAND_ZONE..."
@@ -255,10 +321,10 @@ EOF
             fi
 
             if gcloud compute instances create "$WORKER_NAME" \
-                --source-instance-template="$TEMPLATE_NAME" \
+                --source-instance-template="$WORKER_TEMPLATE" \
                 --zone="$CAND_ZONE" \
                 --project="$PROJECT_ID" \
-                --metadata=startup-script="$STARTUP_SCRIPT"; then
+                --metadata-from-file=startup-script="$STARTUP_SCRIPT_FILE"; then
                 echo "✓ VM $WORKER_NAME launched successfully in zone '$CAND_ZONE'."
                 LAUNCH_SUCCESS=true
                 break
@@ -267,6 +333,8 @@ EOF
             fi
         done
 
+        rm -f "$STARTUP_SCRIPT_FILE"
+
         if [ "$LAUNCH_SUCCESS" = false ]; then
             echo "❌ Error: Could not launch $WORKER_NAME in any candidate zone."
             exit 1
@@ -274,14 +342,35 @@ EOF
     fi
 }
 
-# 3. Launch 3 parallel workers
-launch_worker "cosmos-worker-1" "dx2ct" "naf"
-launch_worker "cosmos-worker-2" "svdrr" "xraysyn"
-launch_worker "cosmos-worker-3" "pixelnerf" "mednerf"
+# 3. Launch workers with optional overrides (--only, --override)
+maybe_launch_worker() {
+    local WORKER_NAME="$1"
+    local DEFAULT_BASELINE_1="$2"
+    local DEFAULT_BASELINE_2="$3"
+    local STAGGER_SECONDS="$4"
+
+    if [ "${#ONLY_WORKERS[@]}" -gt 0 ] && [ -z "${ONLY_WORKERS[$WORKER_NAME]:-}" ]; then
+        echo "⏭  Skipping $WORKER_NAME (not in --only list)."
+        return
+    fi
+
+    local BASELINE_1="$DEFAULT_BASELINE_1"
+    local BASELINE_2="$DEFAULT_BASELINE_2"
+    if [ -n "${WORKER_OVERRIDE[$WORKER_NAME]:-}" ]; then
+        IFS=',' read -r BASELINE_1 BASELINE_2 <<< "${WORKER_OVERRIDE[$WORKER_NAME]}"
+    fi
+
+    launch_worker "$WORKER_NAME" "$BASELINE_1" "$BASELINE_2" "$STAGGER_SECONDS"
+}
+
+maybe_launch_worker "cosmos-worker-1" "dx2ct" "naf" 0
+maybe_launch_worker "cosmos-worker-2" "xraysyn" "" "$DOWNLOAD_STAGGER_SECONDS"
+maybe_launch_worker "cosmos-worker-4" "svdrr" "" "$((DOWNLOAD_STAGGER_SECONDS * 2))"
+maybe_launch_worker "cosmos-worker-5" "pixelnerf" "mednerf" "$((DOWNLOAD_STAGGER_SECONDS * 3))"
 
 echo ""
 echo "====================================================================="
-echo "🎉 All 3 workers launched! Monitor status with:"
+echo "🎉 Launch requests sent! Monitor status with:"
 echo "   gcloud compute instances list --filter='name~cosmos-worker'"
 echo "   gcloud compute instances get-serial-port-output cosmos-worker-1 --zone=$ZONE"
 echo "====================================================================="

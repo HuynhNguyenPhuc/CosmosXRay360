@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import traceback
 import warnings
 
 try:
@@ -33,16 +34,13 @@ except ImportError as e:
     PIXELNERF_MODEL_AVAILABLE = False
     warnings.warn(f"PixelNeRF source package not importable, falling back is unavailable: {e}")
 
-# Setup logger following STYLE.md
-logger = logging.getLogger(__name__)
-
 from models.utils import normalize_tensor
 
-# Object is assumed centered at the world origin with unit-ish extent (matching the
-# [-1, 1]^3 query-point convention elsewhere in this codebase). The source/input view
-# and every novel view orbit this same point at a fixed radius/elevation, matching the
-# turntable sweep convention used by the DiffDRR renderer and every other baseline
-# wrapper (fixed elev, azimuth-only sweep).
+
+# --- Logger --- #
+logger = logging.getLogger(__name__)
+
+# Camera parameters for turntable orbit around origin
 CAMERA_RADIUS = 4.0
 CAMERA_ELEV_DEG = 0.0
 CAMERA_FOV_DEG = 40.0
@@ -172,20 +170,12 @@ def encode_source_view(model: "torch.nn.Module", source_img: "torch.Tensor", dev
 def encode_source_view_repeated(
     model: "torch.nn.Module", source_img: "torch.Tensor", n: int, device: str
 ) -> None:
-    """Encodes ``n`` copies of a single source image, one per target pose in a batch.
-
-    ``PixelNeRFNet.encode``'s stored per-object latent/pose state has one entry per
-    "object" (``self.num_objs``, set from the encoded batch size). Rendering a batch of
-    ``n`` different target poses in one ``NeRFRenderer`` call (superbatch dim ``SB=n``)
-    requires ``self.latent``'s batch to match, since ``ImageEncoder.index`` uses
-    ``F.grid_sample`` (batch dims must be equal, no broadcasting from 1 -> n) -- so the
-    single source image is repeated ``n`` times instead of encoded once.
-    """
+    """Encodes n copies of source image to match target pose batch size."""
     focal = 0.5 * source_img.shape[-1] / np.tan(0.5 * np.radians(CAMERA_FOV_DEG))
     focal_t = torch.tensor(focal, device=device, dtype=torch.float32)
     encode_pose = pose_spherical(0.0, CAMERA_ELEV_DEG, CAMERA_RADIUS).to(device)
-    imgs = source_img.repeat(n, 1, 1, 1)  # (n, 3, H, W)
-    poses = encode_pose.unsqueeze(0).repeat(n, 1, 1)  # (n, 4, 4)
+    imgs = source_img.repeat(n, 1, 1, 1)
+    poses = encode_pose.unsqueeze(0).repeat(n, 1, 1)
     model.encode(imgs.unsqueeze(1), poses=poses.unsqueeze(1), focal=focal_t)
 
 
@@ -217,10 +207,10 @@ def render_views_batched(
 
 
 class PixelNeRFWrapper:
-    """Wrapper for PixelNeRF baseline from cloned/pixel-nerf."""
+    """Wrapper for PixelNeRF baseline."""
 
     def __init__(self, checkpoint_path: str | None = None) -> None:
-        """Initializes and loads the generalizable PixelNeRF network.
+        """Initializes the PixelNeRF network.
 
         Args:
             checkpoint_path: Optional path to pre-trained weights file.
@@ -247,25 +237,14 @@ class PixelNeRFWrapper:
         input_xr: torch.Tensor,
         azimuths: tuple[float, float, int] = (0, 360, 93),
     ) -> list[torch.Tensor]:
-        """Renders novel views by ray-marching PixelNeRF's pixel-aligned density field.
-
-        For each requested azimuth, builds a spherical camera pose (``pose_spherical``,
-        the standard NeRF-pytorch turntable convention also used by this repo's own
-        conf/eval scripts), casts rays through it (``gen_rays``), and alpha-composites
-        RGB via the model's own ``NeRFRenderer`` -- proper stratified sampling +
-        compositing, not a plain density sum over an un-marched, rotated coordinate
-        grid. Target poses are processed in bounded batches (``VIEW_BATCH`` azimuths
-        per ``NeRFRenderer`` call, superbatch dim ``SB``) instead of one azimuth at a
-        time, re-encoding the (repeated) source image to match each chunk (see
-        ``encode_source_view_repeated``'s docstring for why the encode has to be
-        repeated, not just the render).
+        """Renders novel views by ray-marching PixelNeRF's feature field.
 
         Args:
             input_xr: Input 2D projection CXR [1, 1, 256, 256].
             azimuths: Target view boundaries as (start_angle, end_angle, N_views).
 
         Returns:
-            A list of N synthesized 2D novel-view radiography tensors.
+            List of N synthesized 2D novel-view radiography tensors.
         """
         if self.model is None or self.render_wrapper is None:
             return []
@@ -316,7 +295,6 @@ class PixelNeRFWrapper:
                         proj_corrected = normalize_tensor(proj)
                         results.append(proj_corrected)
         except Exception as e:
-            import traceback
             logger.error(f"[PixelNeRF] Inference execution failed: {e}\n{traceback.format_exc()}")
 
         return results

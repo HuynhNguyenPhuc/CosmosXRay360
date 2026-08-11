@@ -57,6 +57,7 @@ CosmosXRay360/             # Repository Root
 │   ├── REVIEWS.md        # Structured MICCAI reviewer concerns & deconstructed requirements
 │   ├── PROPOSAL.md       # SOTA baselines & re-submission roadmap
 │   ├── baselines/        # Per-baseline PAPER.md, CODE.md, and LOG.md documentation
+│   ├── cosmos-predict2.5/ # Cosmos-Predict2.5 main method PAPER.md, CODE.md, and LOG.md
 │   └── reviews/          # Reviewer responses & analyses
 ├── renderers/            # Shared Physical Rendering Engines
 │   └── diffdrr/          # DiffDRR Siddon-Jacob ray-tracing standard

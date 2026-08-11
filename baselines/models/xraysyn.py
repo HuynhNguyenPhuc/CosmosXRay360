@@ -8,11 +8,13 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import traceback
 import warnings
 
 try:
     import numpy as np
     import torch
+    import torch.nn.functional as F
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -29,22 +31,15 @@ try:
 except ImportError:
     XRAYSYN_MODEL_AVAILABLE = False
 
-# Setup logger following STYLE.md
-logger = logging.getLogger(__name__)
-
-
-import torch.nn.functional as F
 from models.utils import normalize_tensor
 
 
-def _get_T_batched(model: "XraySynModel", inp: list[float], batch_size: int) -> torch.Tensor:
-    """Builds a 6-DoF pose transform matching a given batch size.
+# --- Logger --- #
+logger = logging.getLogger(__name__)
 
-    ``XraySynModel.get_T`` (see ``ct2xray_real_gan_meta.py``) hardcodes a batch of 4
-    (``torch.cat([T, T, T, T])``), matching the reference implementation's fixed
-    training batch size. Slice/tile it to the caller's actual batch size so it stays
-    consistent with the volume/image tensors passed to ``proj``/``backproj``.
-    """
+
+def _get_T_batched(model: "XraySynModel", inp: list[float], batch_size: int) -> torch.Tensor:
+    """Builds a 6-DoF pose transform matching a given batch size."""
     T = model.get_T(inp)
     if batch_size <= T.shape[0]:
         return T[:batch_size]
@@ -53,13 +48,7 @@ def _get_T_batched(model: "XraySynModel", inp: list[float], batch_size: int) -> 
 
 
 def _get_T_multi(model: "XraySynModel", azimuths_deg: list[float], batch_size: int) -> torch.Tensor:
-    """Builds one 6-DoF pose transform per azimuth (theta_y sweep, see ``_get_T_batched``).
-
-    Returns a ``(len(azimuths_deg) * batch_size, 4, 4)`` tensor ordered
-    ``[az0, az1, ..., azN-1]`` repeated per input-batch element, matching how the
-    volume/conditioning image are repeat-interleaved for a chunked multi-azimuth
-    ``ct2xray``/``net2d`` call.
-    """
+    """Builds one 6-DoF pose transform per azimuth in degrees."""
     T_stack = torch.cat(
         [model.get_T([1, az / 180.0, 0, 0, 0, 0])[:1] for az in azimuths_deg], dim=0
     )  # (N, 4, 4)
@@ -109,30 +98,14 @@ class XRaySynWrapper:
         input_xr: torch.Tensor,
         azimuths: tuple[float, float, int] = (0, 360, 93),
     ) -> list[torch.Tensor]:
-        """Queries the XRaySyn model to synthesize novel views over specified angles.
-
-        Mirrors the reference ``XraySynModel.test()`` pipeline: backproject the input
-        view into a bone/tissue voxel volume with the frozen ``net3d``, re-project
-        through the differentiable forward projector at each target pose, apply the
-        Beer-Lambert bone/tissue absorption curves (``ct2xray``), then run the learned
-        2D refinement network (``net2d``) before converting back to image space
-        (``mat2xray``). This replaces a prior implementation that rotated the raw
-        voxel grid with a generic affine transform and took a plain orthographic sum
-        -- skipping the projector geometry, the energy-dependent absorption curves,
-        and the refinement network entirely.
-
-        Target poses are processed in bounded batches (``VIEW_BATCH`` azimuths per
-        ``ct2xray``/``net2d``/``mat2xray`` call) instead of one azimuth at a time: the
-        fitted volume/bone-mask/conditioning image are identical across azimuths, so
-        they're repeated to match each chunk instead of re-running the full
-        projector+refinement pipeline once per view.
+        """Synthesizes novel views via backprojection and 2D refinement.
 
         Args:
             input_xr: Input 2D projection CXR [1, 1, 256, 256].
             azimuths: Target view boundaries as (start_angle, end_angle, N_views).
 
         Returns:
-            A list of N synthesized 2D novel-view radiography tensors.
+            List of N synthesized 2D novel-view radiography tensors.
         """
         if self.model is None:
             return []
@@ -199,7 +172,6 @@ class XRaySynWrapper:
                         proj_corrected = normalize_tensor(proj)
                         results.append(proj_corrected)
         except Exception as e:
-            import traceback
             logger.error(f"[XRaySyn] Inference execution failed: {e}\n{traceback.format_exc()}")
 
         return results

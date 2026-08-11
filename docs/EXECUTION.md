@@ -41,17 +41,19 @@ This document provides a comprehensive, actionable guide on how to configure, re
 ## 3. Training Execution Pathways
 
 ### Option A: Parallel GCP Multi-Worker Deployment (Optimal Cloud Execution)
-Deploy 3 isolated L4 GPU instances on GCP in parallel using `template.json` and `scripts/launch_parallel_vms.sh`. Each VM runs inside a Docker container with strict process/CUDA isolation, pairing a heavy baseline with a light/medium baseline and automatically shutting down immediately upon completion to minimize compute costs:
+Deploy isolated GPU instances on GCP in parallel using `template.json` and `scripts/launch_parallel_vms.sh`. Each VM runs inside a Docker container with strict process/CUDA isolation, pairing a heavy baseline with a light/medium baseline where practical, and automatically shutting down immediately upon completion to minimize compute costs:
 
 - **Worker 1 (`cosmos-worker-1`)**: Dx2CT (Heavy) + NAF (Light)
-- **Worker 2 (`cosmos-worker-2`)**: SV-DRR (Heavy) + XRaySyn (Light)
+- **Worker 2 (`cosmos-worker-2`)**: XRaySyn only (SV-DRR moved to Worker 4's dedicated A100 once its own SV-DRR run finished)
 - **Worker 3 (`cosmos-worker-3`)**: PixelNeRF (Medium) + MedNeRF (Medium)
+- **Worker 4 (`cosmos-worker-4`)**: SV-DRR only, on a dedicated A100 instance template (larger batch size than the L4 default)
+- **Worker 5 (`cosmos-worker-5`)**: PixelNeRF (Medium) + MedNeRF (Medium), a second slot
 
 ```bash
 # Preview launch plan without executing
 ./scripts/launch_parallel_vms.sh --dry-run --epochs 50
 
-# Launch 3 parallel GCP worker VMs (L4 GPUs)
+# Launch the default worker set (L4 GPUs, plus worker-4's A100 template)
 ./scripts/launch_parallel_vms.sh --epochs 50 --zone us-central1-a
 ```
 
@@ -152,9 +154,30 @@ This harness:
 > before treating any `baselines/evaluate.py` output as representative.
 
 ### C. Monitoring Training Progress via TensorBoard
-Every `baselines/train/<name>.py` writes live scalars (`Loss/train`, `Loss/val`, per epoch) and a
-prediction-vs-ground-truth image pair (`Images/val_pred_gt`) to its own subdirectory under
-`baselines/checkpoints/tensorboard/`:
+Every `baselines/train/<name>.py` writes live scalars (`Loss/train`, `Loss/val`, per epoch) to its
+own subdirectory under `baselines/checkpoints/tensorboard/`, plus two image tags:
+- `Images/val_multiview` -- a real pred-vs-ground-truth multi-view panel, built by calling the
+  baseline's own `infer_multi_views` (the same paper-faithful, multi-step inference path
+  `baselines/evaluate.py` uses for the benchmark table) against a periodically-snapshotted
+  in-memory checkpoint. Logged every `--viz_every` epochs (default 10, `--viz_views` azimuths per
+  panel, default 4) -- throttled because each firing rebuilds the full inference pipeline, real GPU
+  cost. See `baselines/models/viz.py` and PLAN.md for the full design (why this replaced a former
+  single-step, single-view approximation that rendered as blurry/false-color noise regardless of
+  actual model quality).
+- `Images/val_pred_gt` -- **legacy tag, present only in runs from before this fix.** Current training
+  scripts no longer write it.
+
+For a run whose checkpoint already exists but whose event file only has the legacy single-step
+panel (or none at all), regenerate a correct one without retraining:
+```bash
+uv run python scripts/regenerate_tb_images.py \
+    --baseline svdrr --checkpoint baselines/checkpoints/svdrr_best.pt \
+    --out baselines/checkpoints/tensorboard_fixed/svdrr --views 8 --patients 3
+```
+If a legacy event file's *only* problem is the false-color rendering (content is otherwise fine, so a
+real inference re-run isn't needed), `scripts/fix_tb_event_images.py` rewrites the RGB image
+summaries to grayscale in place (as a new event file) without touching scalars.
+
 ```
 baselines/checkpoints/tensorboard/
 ├── dx2ct/
@@ -186,24 +209,42 @@ training happens inside a container. The template's `accessConfigs` gives each V
 (`ONE_TO_ONE_NAT`), but port 6006 isn't opened in any firewall rule, so the clean path in is an SSH
 tunnel rather than opening a port or browsing the external IP directly:
 
+**The DLVM host has neither `tensorboard` nor `pip3` on PATH** (verified 2026-08-08) -- despite the
+image being marketed as a bundled ML environment, both are missing on the bare host; TensorBoard only
+exists **inside** the `cosmos_baselines` Docker image. The training container also can't be reached
+via `localhost:6006` on the host, because `launch_parallel_vms.sh`'s `docker run` never publishes
+port 6006. The working path is: start TensorBoard *inside* the running training container, then
+tunnel to that **container's own bridge IP**, not `localhost`:
+
 1. **Find which zone the worker actually landed in** -- the launch script tries multiple candidate
    zones on stockout, so it isn't necessarily the `--zone` default:
    ```bash
    gcloud compute instances list --filter='name~cosmos-worker'
    ```
-2. **Open an SSH tunnel and start TensorBoard on the VM in the same step** (`-N` = no remote shell,
-   just hold the tunnel; the DLVM image's bundled Python env already has `tensorboard`):
+2. **Find the running training container's name** (one per worker, started with `--rm` so it only
+   exists while training is in progress):
    ```bash
-   gcloud compute ssh cosmos-worker-1 --zone=<zone-from-step-1> \
-     --project=modular-ethos-468709-u4 \
-     -- -L 6006:localhost:6006 -f -N \
-     "cd /workspace/CosmosXRay360 && nohup tensorboard --logdir baselines/checkpoints/tensorboard --port 6006 > /tmp/tb.log 2>&1 &"
+   gcloud compute ssh cosmos-worker-1 --zone=<zone> --project=modular-ethos-468709-u4 \
+     --command="sudo docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}'"
    ```
-   Or more simply, open a normal interactive SSH session (`gcloud compute ssh cosmos-worker-1
-   --zone=<zone> -- -L 6006:localhost:6006`) and run
-   `tensorboard --logdir baselines/checkpoints/tensorboard --port 6006` in the foreground -- leaving
-   that terminal open keeps both the tunnel and the server alive.
-3. Browse `http://localhost:6006` locally, same as the single-machine case in section 5.C.
+3. **Launch TensorBoard detached inside that container**, then get its bridge IP (this, not
+   `localhost`, is what the tunnel must target):
+   ```bash
+   gcloud compute ssh cosmos-worker-1 --zone=<zone> --project=modular-ethos-468709-u4 \
+     --command="sudo docker exec -d <container_name> tensorboard --logdir /workspace/baselines/checkpoints/tensorboard --port 6006 --host 0.0.0.0"
+
+   gcloud compute ssh cosmos-worker-1 --zone=<zone> --project=modular-ethos-468709-u4 \
+     --command="sudo docker inspect <container_name> --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'"
+   # -> e.g. 172.17.0.2
+   ```
+4. **Tunnel a local port to `<container_ip>:6006`** (not `-L <port>:localhost:6006` -- that hits the
+   VM host's own unlistened port 6006 and just gets connection-reset). `-N -f` backgrounds the tunnel
+   with no remote shell:
+   ```bash
+   gcloud compute ssh cosmos-worker-1 --zone=<zone> --project=modular-ethos-468709-u4 \
+     -- -L 6006:172.17.0.2:6006 -N -f
+   ```
+5. Browse `http://localhost:6006` locally, same as the single-machine case in section C.
 
 **This only works while the VM is up.** Each worker's startup script ends with `sudo shutdown -h now`
 once its 2 baselines finish, specifically to avoid idle billing -- so TensorBoard access disappears

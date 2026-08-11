@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import traceback
 import warnings
 
 try:
@@ -19,25 +20,32 @@ except ImportError:
     TORCH_AVAILABLE = False
     warnings.warn("PyTorch, PIL or NumPy not available")
 
+try:
+    from huggingface_hub import snapshot_download
+    HUGGINGFACE_HUB_AVAILABLE = True
+except ImportError:
+    HUGGINGFACE_HUB_AVAILABLE = False
+
 # Setup early import paths for SV-DRR dependency packages
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(base_dir, "cloned", "SV-DRR"))
 
 try:
-    from pipeline_svdrr_DiT import SvdrrDiTPipeline
+    from pipeline_svdrr_DiT import CCProjection, SvdrrDiTPipeline
     SVDRR_PIPELINE_AVAILABLE = True
 except ImportError:
     SVDRR_PIPELINE_AVAILABLE = False
 
-# Setup logger following STYLE.md
+
+# --- Logger --- #
 logger = logging.getLogger(__name__)
 
 
 class SVDRRWrapper:
-    """Wrapper for SV-DRR baseline from cloned/SV-DRR."""
+    """Wrapper for SV-DRR baseline."""
     
     def __init__(self, checkpoint_path: str | None = None) -> None:
-        """Initializes and builds the SV-DRR 2D latent diffusion pipeline.
+        """Initializes the SV-DRR 2D latent diffusion pipeline.
 
         Args:
             checkpoint_path: Optional path or HuggingFace ID to pre-trained weights.
@@ -51,46 +59,54 @@ class SVDRRWrapper:
             return
         
         try:
-            # SV-DRR pipeline needs a valid local directory: loading directly from
-            # the bare Hub ID fails diffusers' custom-component resolution for
-            # cc_projection/pipeline_svdrr_DiT.py (see train/svdrr.py for the full
-            # explanation), so always materialize a local snapshot first.
             local_base_path = os.path.join(base_dir, "cloned", "SV-DRR", "models", "base_model", "256")
+            stale_base_path = os.path.join(base_dir, "cloned", "SV-DRR", "models", "base_model", "256.stale-2026-08-08")
+            
             if checkpoint_path and os.path.isdir(checkpoint_path):
                 model_id = checkpoint_path
             else:
                 if not os.path.exists(local_base_path):
                     logger.info(f"[SV-DRR] Local base model not found at {local_base_path}; downloading snapshot from HF Hub...")
-                    from huggingface_hub import snapshot_download
-                    snapshot_download(repo_id="xiechun-tsukuba/svdrr-dit-fb-256", local_dir=local_base_path)
+                    SVDRR_BASE_MODEL_REVISION = "151bc201b16fa8d6d01853c2036f7d6b354d50ba"
+                    snapshot_download(
+                        repo_id="xiechun-tsukuba/svdrr-dit-fb-256",
+                        revision=SVDRR_BASE_MODEL_REVISION,
+                        local_dir=local_base_path,
+                    )
                 model_id = local_base_path
+
+            # Detect whether checkpoint requires 4-channel or 8-channel transformer
+            if checkpoint_path and os.path.isfile(checkpoint_path):
+                state = torch.load(checkpoint_path, map_location="cpu")
+                st_dict = state.get("transformer", state)
+                if "pos_embed.proj.weight" in st_dict:
+                    ckpt_in_channels = st_dict["pos_embed.proj.weight"].shape[1]
+                    if ckpt_in_channels == 4 and os.path.exists(stale_base_path):
+                        model_id = stale_base_path
+            else:
+                state = None
                 
-            from pipeline_svdrr_DiT import CCProjection
             cc_projection = CCProjection.from_config(model_id, subfolder="cc_projection")
             self.pipe = SvdrrDiTPipeline.from_pretrained(
                 model_id, cc_projection=cc_projection, torch_dtype=torch.float32,
                 low_cpu_mem_usage=False, ignore_mismatched_sizes=True
             )
             
-            if checkpoint_path and os.path.isfile(checkpoint_path):
-                state = torch.load(checkpoint_path, map_location="cpu")
+            if state is not None:
                 if "transformer" in state:
-                    # train/svdrr.py's checkpoint format: cc_projection is jointly
-                    # fine-tuned there (reference train_svdrr_DiT.py trains it at
-                    # 10x the transformer's lr), so its weights are saved alongside
-                    # the transformer's rather than left at their untrained init.
                     self.pipe.transformer.load_state_dict(state["transformer"])
                     self.pipe.cc_projection.load_state_dict(state["cc_projection"])
                 else:
-                    # Legacy transformer-only checkpoint format.
                     self.pipe.transformer.load_state_dict(state)
-
 
             self.pipe = self.pipe.to(self.device)
             self.model = self.pipe
             logger.info("[SV-DRR] ✓ Loaded successfully")
         except Exception as e:
-            logger.error(f"[SV-DRR] ✗ Failed to initialize pipeline: {str(e)[:80]}")
+            # Reset pipeline on failure to prevent silent fallback to partially initialized base weights
+            logger.error(f"[SV-DRR] ✗ Failed to initialize pipeline: {e}")
+            self.pipe = None
+            self.model = None
     
     def infer_multi_views(
         self,
@@ -141,14 +157,7 @@ class SVDRRWrapper:
             for start in range(0, len(azim_range), VIEW_BATCH):
                 chunk = azim_range[start : start + VIEW_BATCH]
                 n = len(chunk)
-                # Reference test_svdrr_DiT.py negates the requested pose by default
-                # (`flip_pose=False`): "align with training, where pose is condition -
-                # target". Passing the raw (non-negated) azimuth, as before, feeds the
-                # model the opposite sign of the relative pose it was trained on.
-                # _encode_pose's batched branch specifically checks
-                # `isinstance(pose[0], list)` -- a numpy array of rows fails that
-                # check and falls through to a single-pose code path that mis-shapes
-                # a multi-row array, so this must be a plain list of lists.
+                # Pose relative angle negated to align with training convention
                 poses = [[0, -float(azimuth), 0] for azimuth in chunk]
                 with torch.no_grad():
                     result = self.pipe(
@@ -167,7 +176,6 @@ class SVDRRWrapper:
                         out_tensor = (out_tensor - out_tensor.min()) / (out_tensor.max() - out_tensor.min() + 1e-8)
                         results.append(out_tensor.float().to(self.device))
         except Exception as e:
-            import traceback
             logger.error(f"[SV-DRR] Inference execution failed: {e}\n{traceback.format_exc()}")
 
         return results

@@ -122,7 +122,7 @@ class Inferencer:
             cpu_offload=self.cpu_offload,
         )
 
-    def _resolve_artifact(self, spec: str, artifact_name: str) -> str:
+    def _resolve_artifact(self, spec: Optional[str], artifact_name: str) -> Optional[str]:
         """
         Resolve artifact specification to a local file path, supporting multiple formats.
 
@@ -131,8 +131,11 @@ class Inferencer:
             artifact_name: Human-readable name of the artifact type (used for logging).
 
         Returns:
-            A local file path string where the artifact can be accessed.
+            A local file path string where the artifact can be accessed, or None/empty if spec is None/empty.
         """
+        if not spec:
+            return spec
+
         # First check if the spec is a valid local path
         path_candidate = Path(spec)
         if path_candidate.exists():
@@ -443,7 +446,8 @@ class Inferencer:
             )
 
         # Run the DiT forward pass to predict the velocity.
-        with torch.autocast(device_type=self.device, dtype=self.runtime_dtype): 
+        autocast_device = "cuda" if "cuda" in str(self.device) else "cpu"
+        with torch.autocast(device_type=autocast_device, dtype=self.runtime_dtype): 
             net_output = self.dit(
                 x_B_C_T_H_W=xt_b_c_t_h_w.to(device=self.device, dtype=model_dtype),
                 timesteps_B_T=timesteps_b_t.to(device=self.device, dtype=model_dtype),

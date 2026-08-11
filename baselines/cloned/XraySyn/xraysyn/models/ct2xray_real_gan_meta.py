@@ -96,6 +96,14 @@ class XraySynModel(Base):
         atten_bone = self.bone_absorb(bone_proj)
         atten_tissue = self.tissue_absorb(tissue_proj)
         atten_proj = atten_bone+atten_tissue
+        # Clamp before exp() to prevent inf/nan -- see the matching clamp in
+        # mat2xray() below and the 2026-08-07 LOG.md entry for why this is
+        # needed now: the fixed/pretrained bone_absorb/tissue_absorb
+        # calibration functions were never exercised on the widened 360deg
+        # camera range (this project's fix, not the original paper's ±9deg)
+        # against a *real* projector output until today's CUDA extension fix,
+        # and produced large enough atten_proj values to overflow exp().
+        atten_proj = torch.clamp(atten_proj, max=50.0)
         out_new = torch.exp(atten_proj).sum(dim=1).view(vol.shape[0],1,128,128)
         out_new = self.norm(out_new.max() - out_new)
         return out_new, torch.cat([bone_proj, tissue_proj],1)
@@ -108,6 +116,8 @@ class XraySynModel(Base):
             atten_bone = self.bone_absorb(mat[:,[0]])
         atten_tissue = self.tissue_absorb(mat[:,[1]])
         atten_proj = atten_bone+atten_tissue
+        # See the matching clamp + comment in ct2xray() above.
+        atten_proj = torch.clamp(atten_proj, max=50.0)
         out_new = torch.exp(atten_proj).sum(dim=1).view(mat.shape[0],1,256,256)
         out_new = self.norm(out_new.max() - out_new)
         return out_new

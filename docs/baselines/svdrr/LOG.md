@@ -68,3 +68,35 @@ small to be worth pinning ~36k cached latents in host RAM for); left as a docume
 **Verification:** `uv run pytest baselines/tests/test_svdrr_wrapper.py` (pass) and `python -m py_compile
 baselines/train/svdrr.py`. Wall-clock speedup **not yet measured** — see dx2ct's identically-dated entry
 for the same Phase 4 caveat.
+
+---
+
+## 2026-08-07 — Real Mini-Batch Training (Was Effectively Batch=1) + Gradient Accumulation to Match the Paper's Batch=64
+
+**Phase:** 2 & 3 (Fairness Correctness & Acceleration)
+**Files:** `baselines/train/svdrr.py`
+**Change:** The training loop previously ran one `(source, target)` pair per gradient step (`for item in
+train_cached: ... optimizer.step()`) -- an effective batch size of 1, which doesn't match the paper's own
+reported recipe of batch 64 (`docs/baselines/svdrr/PAPER.md` section 3: "200K steps at 256 res" on batch
+64). Replaced with real mini-batch training: `sample_batch(batch_size)` draws `batch_size` pairs from
+`batch_size` randomly-chosen (with replacement) cached patients via the existing, unchanged `sample_pair`,
+stacks them, and one gradient step processes the whole batch (`_encode_pose` already accepts a
+list-of-lists pose batch with no changes needed to the vendored pipeline; `timesteps` now sampled one per
+batch item instead of one shared timestep for the whole step). Also added `--accum_steps` (gradient
+accumulation): `batch_size=16` micro-batches accumulated over `accum_steps=4` gradient calls before a
+single `optimizer.step()` gives an *effective* batch of 64, matching the paper exactly, without ever
+holding 64 samples' activations in VRAM at once (`micro_loss / accum_steps` before each `.backward()`,
+so the summed gradient equals the true mean gradient over the full effective batch, not just an
+extra unweighted average).
+**Why:** User-requested ("keep the fairness, try to do like the original paper do") rather than just
+inflating the epoch count on the old batch-1 loop, which would only ever match the paper's *step count*,
+not its actual per-step training dynamics (batch 64 sees 64x more data per gradient signal than batch 1).
+**Verification:** Local testing on a 24GB GPU (Titan RTX) with `--max_train_samples 20` (fast smoke-test
+slices, not the full ~1000-patient set): `--batch_size 8` (no accumulation) completed cleanly, real
+non-`nan` losses. `--batch_size 64` (one shot, no accumulation) **OOMs**:
+`CUDA out of memory... 22.61 GiB memory in use` out of the GPU's 23.46 GiB. `--batch_size 4 --accum_steps
+3` (validating the accumulation code path itself) completed cleanly, real non-`nan` losses, checkpoints
+saved correctly. Did not separately re-test the actual chosen default (`--batch_size 16 --accum_steps 4`)
+in isolation -- reasoned safe from the batch=8-clean / batch=64-OOM data points (16 is well below the OOM
+threshold with real margin), but this should be confirmed with an actual run before fully trusting it at
+scale, not just extrapolated.

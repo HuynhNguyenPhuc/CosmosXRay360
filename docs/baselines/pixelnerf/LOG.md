@@ -52,3 +52,33 @@ plain conv/MLP forward with no diffusion scheduler or custom CUDA kernel) — le
 pending a real Phase 4 regression + wall-clock measurement, not applied blind.
 **Verification:** `uv run pytest baselines/tests/test_pixelnerf_wrapper.py baselines/tests/test_loss_regression.py::test_pixelnerf_coarse_mlp_receives_gradient`
 (pass) and `python -m py_compile baselines/train/pixelnerf.py`. Wall-clock speedup **not yet measured**.
+
+---
+
+## 2026-08-07 — Fixed Fixed-Single-View Training Scope (Real Correctness Gap, Not Just Epoch Count)
+
+**Phase:** 2 (Training Scope / Fairness Correctness)
+**Files:** `baselines/train/pixelnerf.py`
+**Change:** Training target view is now sampled randomly from the full 93-view pre-rendered sweep per
+patient (excluding index 0, the frontal/PA pose matching the source image), instead of always
+`LATERAL_AZIMUTH_DEG = 90.0`. Added `cache_train_tensors`/`sample_train_target` (loads all
+`views/*.png` + their azimuth angles, mirroring `baselines/train/svdrr.py`'s `cache_dataset`/
+`sample_pair`) alongside the original `cache_val_tensors` (unchanged, still PA+LAT only) so
+validation stays a single fixed, stable, comparable metric across epochs.
+**Why:** A real 8-epoch training run's val loss bottomed at epoch 5 (0.019171) then rose for 3
+consecutive epochs (0.019251 → 0.019338 → 0.019571) while train loss kept falling — classic
+overfitting to one specific task. The root cause: this wrapper trained on the *single* PA→LAT (90°)
+pair every step, ever, while `baselines/evaluate.py` scores a full 360° sweep — verified directly
+against the original repo's own `train/train.py` (`calc_losses`/`train_step`), which samples random
+rays across *all* views and a random source/target split every step
+(`pix_inds = torch.randint(0, NV * H * W, ...)`, `view_dest = np.random.randint(...)`). This is the
+exact same training-scope/fairness gap class already found and fixed for SV-DRR (fixed 90°-apart pair
+→ full 93-view random pairs) and XRaySyn (±9° → full 360° `OTHER_POSE_THETA_Y_RANGE`) — PixelNeRF was
+simply never given the same treatment, and a cross-baseline consistency check (per this project's
+`baseline-experiment` skill's Phase 2 checklist) would have caught this earlier than a live overfitting
+signal did.
+**Verification:** Local smoke test (`uv run python baselines/train/pixelnerf.py --epochs 1
+--max_train_samples 3 --max_val_samples 2`) runs end-to-end, produces real (non-NaN) train/val loss,
+and saves checkpoints. The previous checkpoint (trained under the fixed-90°-only setup, which already
+showed an overfitting signal by epoch 8) needs a full retrain under this fix before any new benchmark
+number is trusted — not yet done as of this entry.
