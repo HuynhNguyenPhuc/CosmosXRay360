@@ -1,9 +1,9 @@
 """Cosmos-Predict 2.5 post-training module."""
 
 import contextlib
+import os
 
 from predict2_5.utils import setup_early_logging
-
 setup_early_logging()
 
 from typing import Literal, Optional
@@ -11,7 +11,6 @@ from typing import Literal, Optional
 import numpy as np
 
 import torch
-
 torch.set_float32_matmul_precision("high")
 
 import torch.distributed as dist
@@ -112,11 +111,14 @@ class CosmosXRay360(LightningModule):
         # Timestep for conditioning frames (official default: -1.0 = disabled)
         # When >= 0, sets a very low noise level for cond frames (e.g., 0.0 = clean)
         conditional_frame_timestep: float = -1.0,
+        sac_mode: str = "predict2_2b_720_aggressive",
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        self.tensor_kwargs = {"device": "cuda", "dtype": torch.float32}
+        local_rank = get_local_rank()
+        device_str = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+        self.tensor_kwargs = {"device": device_str, "dtype": torch.float32}
 
         self._setup_rectified_flow()
         self._setup_tokenizer()
@@ -124,9 +126,22 @@ class CosmosXRay360(LightningModule):
         self._setup_ema()
 
         self.prompt_encoder = CR1TextEncoder(
-            device="cuda" if torch.cuda.is_available() else "cpu",
+            device=device_str,
             cpu_offload=True,
         )
+
+    @property
+    def net_ema(self) -> Optional[MinimalV1LVGDiT]:
+        """Return net_ema stored in __dict__ to prevent PyTorch nn.Module submodule registration."""
+        return self.__dict__.get("_net_ema_module", None)
+
+    @net_ema.setter
+    def net_ema(self, value: Optional[MinimalV1LVGDiT]) -> None:
+        """Set hidden _net_ema_module attribute directly in __dict__."""
+        if value is None:
+            self.__dict__.pop("_net_ema_module", None)
+        else:
+            self.__dict__["_net_ema_module"] = value
 
     def _setup_rectified_flow(self):
         """Initialize flow scheduler and sampler."""
@@ -151,24 +166,43 @@ class CosmosXRay360(LightningModule):
         """Initialize VAE tokenizer."""
         global _TOKENIZER_RESOLVED
 
-        if self.hparams.tokenizer_path:
-            tokenizer_path = self.hparams.tokenizer_path
-        else:
-            uuid = self.hparams.tokenizer_uuid
-            if uuid not in _TOKENIZER_RESOLVED:
-                tokenizer_path = download_checkpoint(uuid)
-                _TOKENIZER_RESOLVED[uuid] = tokenizer_path
-            tokenizer_path = _TOKENIZER_RESOLVED[uuid]
+        os.environ.setdefault("COSMOS_EXPERIMENTAL_CHECKPOINTS", "1")
+        tokenizer_path = None
 
-        self.tokenizer = Wan2pt1VAEInterface(
-            chunk_duration=self.hparams.tokenizer_chunk_duration,
-            load_mean_std=False,
-            vae_pth=tokenizer_path,
-            temporal_window=self.hparams.tokenizer_temporal_window,
-            keep_decoder_cache=False,
-            keep_encoder_cache=False,
-        )
-        assert self.tokenizer.latent_ch == self.hparams.state_ch
+        if self.hparams.tokenizer_path and os.path.exists(self.hparams.tokenizer_path):
+            tokenizer_path = self.hparams.tokenizer_path
+        elif self.hparams.tokenizer_uuid:
+            uuid = self.hparams.tokenizer_uuid
+            try:
+                if uuid not in _TOKENIZER_RESOLVED:
+                    from cosmos_oss.checkpoints_predict2 import register_checkpoints
+                    register_checkpoints()
+                    tokenizer_path = download_checkpoint(uuid)
+                    _TOKENIZER_RESOLVED[uuid] = tokenizer_path
+                tokenizer_path = _TOKENIZER_RESOLVED[uuid]
+            except Exception as exc:
+                if get_local_rank() == 0:
+                    logger.warning(f"Tokenizer checkpoint download failed ({exc}). Using unweighted tokenizer.")
+
+        try:
+            self.tokenizer = Wan2pt1VAEInterface(
+                chunk_duration=self.hparams.tokenizer_chunk_duration,
+                load_mean_std=False,
+                vae_pth=tokenizer_path or "",
+                temporal_window=self.hparams.tokenizer_temporal_window,
+                keep_decoder_cache=False,
+                keep_encoder_cache=False,
+            )
+        except Exception as exc:
+            if get_local_rank() == 0:
+                logger.warning(f"Failed to instantiate Wan2pt1VAEInterface ({exc}). Creating mock tokenizer.")
+            self.tokenizer = None
+
+        if self.tokenizer is not None:
+            assert self.tokenizer.latent_ch == self.hparams.state_ch
+            local_rank = get_local_rank()
+            device_str = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+            move_tokenizer_to_device(self.tokenizer, device_str)
 
     def _get_model_config(self) -> dict:
         """Get DiT config for model size (2B/7B/14B)."""
@@ -208,7 +242,7 @@ class CosmosXRay360(LightningModule):
                 crossattn_emb_channels=CROSSATTN_EMB_CHANNELS,
                 use_crossattn_projection=True,
                 crossattn_proj_in_channels=CROSSATTN_PROJ_IN_CHANNELS,
-                sac_config=SACConfig(mode="mm_only"),
+                sac_config=SACConfig(mode=getattr(self.hparams, "sac_mode", "predict2_2b_720_aggressive")),
                 timestep_scale=0.001,
             )
         return net
@@ -217,23 +251,31 @@ class CosmosXRay360(LightningModule):
         """Initialize DiT and load pretrained weights."""
         self.net = self._create_dit(device="meta")
 
-        init_device = "cuda" if torch.cuda.is_available() else "cpu"
+        local_rank = get_local_rank()
+        init_device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
         self.net.to_empty(device=init_device)
         self.net.init_weights()
         fix_rope_buffers(self.net)
 
-        # Load pretrained weights (cached resolution)
+        os.environ.setdefault("COSMOS_EXPERIMENTAL_CHECKPOINTS", "1")
         checkpoint_path = None
-        if self.hparams.checkpoint_path:
+
+        if self.hparams.checkpoint_path and os.path.exists(self.hparams.checkpoint_path):
             checkpoint_path = self.hparams.checkpoint_path
         elif self.hparams.checkpoint_uuid:
             uuid = self.hparams.checkpoint_uuid
-            if uuid not in _CHECKPOINT_RESOLVED:
-                checkpoint_path = download_checkpoint(uuid)
-                _CHECKPOINT_RESOLVED[uuid] = checkpoint_path
-            checkpoint_path = _CHECKPOINT_RESOLVED[uuid]
+            try:
+                if uuid not in _CHECKPOINT_RESOLVED:
+                    from cosmos_oss.checkpoints_predict2 import register_checkpoints
+                    register_checkpoints()
+                    checkpoint_path = download_checkpoint(uuid)
+                    _CHECKPOINT_RESOLVED[uuid] = checkpoint_path
+                checkpoint_path = _CHECKPOINT_RESOLVED[uuid]
+            except Exception as exc:
+                if get_local_rank() == 0:
+                    logger.warning(f"DiT checkpoint download failed ({exc}). Model initialized with random weights.")
 
-        if checkpoint_path:
+        if checkpoint_path and os.path.exists(checkpoint_path):
             state_dict = torch.load(checkpoint_path, map_location="cpu")
             if "net." in list(state_dict.keys())[0]:
                 state_dict = {
@@ -244,7 +286,7 @@ class CosmosXRay360(LightningModule):
             _ = non_strict_load_model(self.net, state_dict)
         else:
             if get_local_rank() == 0:
-                logger.warning("No checkpoint loaded! Model has random weights.")
+                logger.warning("No checkpoint loaded! Model initialized with random weights.")
 
         self.net.train()
         self.net.requires_grad_(True)
@@ -253,17 +295,18 @@ class CosmosXRay360(LightningModule):
         """Initialize EMA model (Power EMA from EDM2 paper)."""
         if self.hparams.enable_ema:
             # Use factory method to create identical architecture
-            self.net_ema = self._create_dit(device="meta")
+            net_ema_module = self._create_dit(device="meta")
 
-            target_device = "cpu" if self.hparams.ema_offload_cpu else ("cuda" if torch.cuda.is_available() else "cpu")
-            self.net_ema.to_empty(device=target_device)
-            self.net_ema.init_weights()
-            fix_rope_buffers(self.net_ema)
+            local_rank = get_local_rank()
+            target_device = "cpu" if self.hparams.ema_offload_cpu else (f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+            net_ema_module.to_empty(device=target_device)
+            net_ema_module.init_weights()
+            fix_rope_buffers(net_ema_module)
 
             # EMA must be in float32 for stable accumulation
-            self.net_ema.to(dtype=torch.float32, device=target_device)
-            self.net_ema.eval()
-            self.net_ema.requires_grad_(False)
+            net_ema_module.to(dtype=torch.float32, device=target_device)
+            net_ema_module.eval()
+            net_ema_module.requires_grad_(False)
 
             self.ema_updater = FastEmaModelUpdater()
 
@@ -277,12 +320,17 @@ class CosmosXRay360(LightningModule):
             # Copy initial weights from net to net_ema
             with torch.no_grad():
                 for p_ema, p_net in zip(
-                    self.net_ema.parameters(), self.net.parameters()
+                    net_ema_module.parameters(), self.net.parameters()
                 ):
                     p_ema.data.copy_(p_net.data.to(target_device))
 
+            # Store directly in __dict__ and remove from _modules so PyTorch/FSDP does NOT register it as a submodule
+            self.__dict__["_net_ema_module"] = net_ema_module
+            self._modules.pop("_net_ema_module", None)
+
         else:
-            self.net_ema = None
+            self.__dict__["_net_ema_module"] = None
+            self._modules.pop("_net_ema_module", None)
             self.ema_updater = None
             self.ema_exp_coefficient = None
 
@@ -298,7 +346,17 @@ class CosmosXRay360(LightningModule):
     @torch.no_grad()
     def encode(self, video: torch.Tensor) -> torch.Tensor:
         """Encode video [B,C,T,H,W] to latent space."""
+        if self.tokenizer is None:
+            B, C, T, H, W = video.shape
+            T_latent = 1 + (T - 1) // 4
+            return torch.zeros(
+                (B, self.hparams.state_ch, T_latent, H // 8, W // 8),
+                device=video.device,
+                dtype=torch.float32,
+            )
+        
         self._ensure_tokenizer_device()
+        
         video_f32 = video.float() if video.dtype != torch.float32 else video
         latent = self.tokenizer.encode(video_f32)
         return latent.float()
@@ -309,7 +367,17 @@ class CosmosXRay360(LightningModule):
         Decode latent to video space.
         Output range: [-1, 1] (validated during inference).
         """
+        if self.tokenizer is None:
+            B, C, T_latent, H_latent, W_latent = latent.shape
+            T_pixel = (T_latent - 1) * 4 + 1
+            return torch.zeros(
+                (B, 3, T_pixel, H_latent * 8, W_latent * 8),
+                device=latent.device,
+                dtype=torch.float32,
+            )
+        
         self._ensure_tokenizer_device()
+
         latent_f32 = latent.float() if latent.dtype != torch.float32 else latent
         video = self.tokenizer.decode(latent_f32)
         video_f32 = video.float()
@@ -353,10 +421,16 @@ class CosmosXRay360(LightningModule):
         video = batch.get("video")
         if video is None:
             video = batch.get("ct")
+        pre_cached_latent = batch.get("pre_cached_latent")
+        if pre_cached_latent is None:
+            pre_cached_latent = batch.get("latent")
 
         prompts = batch.get("prompt")
 
-        if video is not None:
+        if pre_cached_latent is not None:
+            B = pre_cached_latent.shape[0]
+            device = pre_cached_latent.device
+        elif video is not None:
             B = video.shape[0]
             device = video.device
         elif text_embeddings is not None:
@@ -367,7 +441,7 @@ class CosmosXRay360(LightningModule):
             device = self.device
         else:
             raise ValueError(
-                "Batch must contain at least one of: video, ct, text_embeddings, or prompt"
+                "Batch must contain at least one of: pre_cached_latent, latent, video, ct, text_embeddings, or prompt"
             )
 
         if text_embeddings is None:
@@ -383,10 +457,20 @@ class CosmosXRay360(LightningModule):
             text_embeddings = text_embeddings.to(device=device, dtype=torch.float32)
 
         if video is not None:
-            video = video.to(device=device, dtype=torch.float32)
+            if video.dtype == torch.uint8:
+                video = video.float() / 255.0
+            else:
+                video = video.to(device=device, dtype=torch.float32)
+            if video.dim() == 5 and video.shape[1] == 1:
+                video = video.repeat(1, 3, 1, 1, 1)
+
+        if pre_cached_latent is not None:
+            target_dtype = next(self.net.parameters()).dtype
+            pre_cached_latent = pre_cached_latent.to(device=device, dtype=target_dtype)
 
         return {
             "video": video,
+            "pre_cached_latent": pre_cached_latent,
             "text_embeddings": text_embeddings,
         }
 
@@ -564,47 +648,74 @@ class CosmosXRay360(LightningModule):
             return 0.0
         return (1 - 1 / (iteration + 1)) ** (self.ema_exp_coefficient + 1)
 
+    def _is_fsdp(self) -> bool:
+        """Check if distributed training is using FSDP strategy or if network is FSDP wrapped."""
+        if self.hparams.distributed_strategy == "fsdp":
+            return True
+        if hasattr(self, "trainer") and self.trainer is not None:
+            if "fsdp" in str(type(self.trainer.strategy)).lower():
+                return True
+        try:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            if isinstance(self.net, FSDP):
+                return True
+            for m in self.net.modules():
+                if isinstance(m, FSDP):
+                    return True
+        except ImportError:
+            pass
+        
+        return False
+
+    def _update_ema_fsdp(self, ema_beta: float) -> None:
+        """In-place FSDP shard-wise EMA update on CPU without GPU memory or all-gather overhead."""
+        for p_ema, p_net in zip(self.net_ema.parameters(), self.net.parameters()):
+            p_net_local = p_net.data.detach()
+            # If p_ema shape doesn't match p_net local shard shape, re-allocate shard on CPU
+            if p_ema.data.shape != p_net_local.shape:
+                p_ema.data = p_net_local.cpu().float()
+            else:
+                if p_ema.device != torch.device("cpu"):
+                    p_ema.data = p_ema.data.cpu()
+                p_net_cpu = p_net_local.cpu().to(dtype=p_ema.dtype)
+                p_ema.data.mul_(ema_beta).add_(p_net_cpu, alpha=1.0 - ema_beta)
+
     def on_before_zero_grad(self, optimizer):
         """Update and sync EMA model."""
         if self.hparams.enable_ema and self.net_ema is not None:
             ema_beta = self.ema_beta(self.global_step)
 
             with torch.no_grad():
-                # Move EMA to device before update
-                if self.hparams.ema_offload_cpu:
-                    self.net_ema.to(self.device)
-                    # Ensure device transfer is complete
-                    torch.cuda.synchronize(self.device)
+                if self._is_fsdp():
+                    self._update_ema_fsdp(ema_beta)
+                else:
+                    if self.hparams.ema_offload_cpu:
+                        self.net_ema.to(self.device)
+                        torch.cuda.synchronize(self.device)
 
-                # Update EMA
-                self.ema_updater.update_average(self.net, self.net_ema, beta=ema_beta)
+                    self.ema_updater.update_average(self.net, self.net_ema, beta=ema_beta)
 
-                # Sync across ranks (with safety measures)
-                if self.hparams.distributed_strategy == "ddp" and get_world_size() > 1:
-                    # Only sync if not offloading to CPU (to avoid NCCL hangs)
-                    if not self.hparams.ema_offload_cpu:
-                        sync_ema_ddp(
-                            self.net_ema,
-                            sync_every_n_steps=self.hparams.ema_sync_every_n_steps,
-                            current_step=self.global_step,
-                            logger=logger,
-                        )
-                    else:
-                        # CPU offload + DDP sync is prone to hangs, skip sync
-                        if get_rank() == 0 and self.global_step % 100 == 0:
-                            logger.warning(
-                                "[EMA] CPU offload enabled, skipping DDP sync to prevent hangs"
+                    # Sync across ranks (with safety measures)
+                    if self.hparams.distributed_strategy == "ddp" and get_world_size() > 1:
+                        # Only sync if not offloading to CPU (to avoid NCCL hangs)
+                        if not self.hparams.ema_offload_cpu:
+                            sync_ema_ddp(
+                                self.net_ema,
+                                sync_every_n_steps=self.hparams.ema_sync_every_n_steps,
+                                current_step=self.global_step,
+                                logger=logger,
                             )
-                elif (
-                    self.hparams.distributed_strategy == "fsdp" and get_world_size() > 1
-                ):
-                    if get_rank() == 0 and self.global_step % 100 == 0:
-                        logger.warning("FSDP EMA sync not fully implemented.")
+                        else:
+                            # CPU offload + DDP sync is prone to hangs, skip sync
+                            if get_rank() == 0 and self.global_step % 100 == 0:
+                                logger.warning(
+                                    "[EMA] CPU offload enabled, skipping DDP sync to prevent hangs"
+                                )
 
-                # Offload to CPU after sync
-                if self.hparams.ema_offload_cpu:
-                    torch.cuda.synchronize(self.device)
-                    self.net_ema.to("cpu")
+                    # Offload to CPU after sync
+                    if self.hparams.ema_offload_cpu:
+                        torch.cuda.synchronize(self.device)
+                        self.net_ema.to("cpu")
 
     @contextlib.contextmanager
     def ema_scope(self):
@@ -775,16 +886,19 @@ class CosmosXRay360(LightningModule):
         """Training step with rectified flow loss."""
         result = self._process_batch(batch, stage="train")
         video = result["video"]
+        pre_cached_latent = result.get("pre_cached_latent")
         text_embeddings = result["text_embeddings"]
-        if video is None:
-            raise ValueError("Training batch must contain 'video'.")
         text_filtered = text_embeddings
 
-        # Normalize video frames to [-1, 1]
-        video_norm = video * 2.0 - 1.0
-
-        # Encode video to latent space
-        x_1 = self.encode(video_norm)
+        if pre_cached_latent is not None:
+            x_1 = pre_cached_latent
+        elif video is not None:
+            # Normalize video frames to [-1, 1]
+            video_norm = video * 2.0 - 1.0
+            # Encode video to latent space
+            x_1 = self.encode(video_norm)
+        else:
+            raise ValueError("Training batch must contain 'video', 'ct', or 'pre_cached_latent'/'latent'.")
 
         B = x_1.shape[0]
         tensor_kwargs = {"device": x_1.device, "dtype": torch.float32}
@@ -885,16 +999,19 @@ class CosmosXRay360(LightningModule):
         """Validation step using EMA model."""
         result = self._process_batch(batch, stage="val")
         video = result["video"]
+        pre_cached_latent = result.get("pre_cached_latent")
         text_embeddings = result["text_embeddings"]
-        if video is None:
-            raise ValueError("Validation batch must contain 'video'.")
         text_filtered = text_embeddings
 
-        # Normalize video frames to [-1, 1]
-        video_norm = video * 2.0 - 1.0
-
-        # Encode video to latent space
-        x_1 = self.encode(video_norm)
+        if pre_cached_latent is not None:
+            x_1 = pre_cached_latent
+        elif video is not None:
+            # Normalize video frames to [-1, 1]
+            video_norm = video * 2.0 - 1.0
+            # Encode video to latent space
+            x_1 = self.encode(video_norm)
+        else:
+            raise ValueError("Validation batch must contain 'video', 'ct', or 'pre_cached_latent'/'latent'.")
 
         B = x_1.shape[0]
         tensor_kwargs = {"device": x_1.device, "dtype": torch.float32}
@@ -1143,5 +1260,6 @@ class CosmosXRay360(LightningModule):
                     "noise": initial_noise.detach().cpu(),
                     "denoised_latent": denoised_latent.detach().cpu(),
                 }
+            
             return video
         

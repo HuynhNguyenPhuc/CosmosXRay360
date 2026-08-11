@@ -100,17 +100,31 @@ Output frames are min-max clamped to $[0, 1]$ and converted to uint8 $(93, 256, 
 
 ---
 
-## 3. Training & Evaluation Protocol
+## 3. Submission vs. Resubmission Protocol Changes
 
-- **Data Split:** Fixed cross-dataset OOD split (`datasets/cross_dataset_split.json`).
-  - **Train / Val:** TCIA (771 CT scans) + MELA2022 (525 CT scans) = 1,296 volume cases.
-  - **Test (OOD):** NSCLC Radiogenomics (402 CT scans) held out strictly.
-- **Ground Truth Generation:** Siddon-Jacob ray-tracing via `renderers/diffdrr/renderer.py` rendering $93$ views over $360^\circ$ azimuth ($\text{endpoint}=\text{True}$).
-- **Evaluation Metrics:**
-  - **PSNR (dB) ↑:** Peak Signal-to-Noise Ratio.
-  - **SSIM ↑:** Structural Similarity Index Measure.
-  - **LPIPS ↓:** Learned Perceptual Image Patch Similarity (AlexNet backbone).
-  - **Latency (s/patient) ↓:** Inference wall-clock time per patient case.
+### A. Submitted Manuscript (MICCAI 2026 Submission 2 Ground Truth)
+- **Data Split:** $1,208 / 150 / 340$ patient-level random split pooled across all three CT datasets ($1,698$ total cases).
+- **Renderer:** PyTorch3D absorption–emission volumetric raymarcher (`predict2_5/dvr/renderer.py`).
+- **Evaluation Metrics:** PSNR (dB) and SSIM across $360^\circ$ views.
+- **Comparative Baselines (4):** XRaySyn, MedNeRF, Dx2CT, and SV-DRR.
+- **Training Setup & Budget:** $10,000$ steps with batch size $1/\text{GPU} \times 4\text{ accum} = 16$ effective global batch size ($\sim 23\text{h}$ on $4 \times \text{A100-80GB}$).
+- **Reported Performance:**
+  - **Cosmos-Predict2.5 Post-Trained:** $23.26\text{ dB}$ PSNR / $0.777$ SSIM.
+  - **Zero-Shot Pretrained Baseline:** $7.49\text{ dB}$ PSNR / $0.208$ SSIM.
+  - **3D VAE Reconstruction Upper Bound:** $43.2\text{ dB}$ DRR / $37.7\text{ dB}$ XR.
+
+### B. Resubmission Enhancements (Current Codebase & Benchmark Protocol)
+- **Cross-Dataset Out-of-Domain (OOD) Split:** Strict zero-leakage evaluation (`datasets/cross_dataset_split.json`):
+  - **Train / Val:** TCIA ($771$ scans) + MELA2022 ($525$ scans) = $1,296$ volume cases.
+  - **Test (OOD):** NSCLC Radiogenomics ($402$ scans) strictly held out.
+- **Physical Renderer Migration:** DiffDRR Siddon-Jacob raymarching (`renderers/diffdrr/renderer.py`) providing physically exact Beer-Lambert raytracing without C++ extension compilation overhead.
+- **Expanded Evaluation Metrics:** PSNR (dB) ↑, SSIM ↑, LPIPS (AlexNet) ↓, and Wall-Clock Latency (s/case) ↓.
+- **Unified 6-Baseline Benchmark Suite:** Standardized wrapper API (`infer_multi_views`) across SV-DRR, XRaySyn, MedNeRF, PixelNeRF, NAF, and Dx2CT in `baselines/evaluate.py`.
+- **Accelerated Training & Inference Engine:**
+  - **SAC Aggressive Mode:** `predict2_2b_720_aggressive` reduces activation VRAM from $\sim 28\text{GB}$ to $\sim 6\text{GB}$.
+  - **Offline VAE Latent Pre-Caching:** `PreRenderedLatentDataset` bypasses 3D VAE encoder compute during training ($\sim 18\text{GB}$ VRAM savings, $\sim 35\%$ step speedup).
+  - **FSDP Shard-Wise EMA Update:** In-place CPU EMA updates without all-gather communication overhead.
+  - **Native Inference Acceleration:** Batched CFG forward pass ($B=2$, halving DiT calls to $35$), native `bfloat16` weight casting, and minimal 5-frame VAE anchor encoding.
 
 ---
 

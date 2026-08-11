@@ -9,6 +9,7 @@ import logging
 import argparse
 from datetime import datetime
 
+import torch
 from lightning.pytorch import Trainer, seed_everything
 from lightning.pytorch.callbacks import (
     ModelCheckpoint,
@@ -27,7 +28,7 @@ from predict2_5.callbacks import (
 )
 
 from predict2_5.datamodule import PreRenderedDataModule
-from predict2_5.utils import get_logger
+from predict2_5.utils import get_logger, get_local_rank
 
 
 # --- Logger --- #
@@ -41,6 +42,7 @@ class TrainingConfig:
 
     # Model
     model_size: str = "2B"
+    sac_mode: str = "predict2_2b_720_aggressive"
     checkpoint_path: str = None
     tokenizer_path: str = None
 
@@ -68,13 +70,17 @@ class TrainingConfig:
     num_gpus: int = 4
     batch_size: int = 1
     accumulate_grad_batches: int = 1
-    num_workers: int = 6
-    prefetch_factor: int = 4
+    num_workers: int = 4
+    prefetch_factor: int = 2
+    pin_memory: bool = True
+    persistent_workers: bool = True
     strategy: str = "auto"
     ema_sync_every_n_steps: int = 100
 
     # Data
     dataset_path: str = "datasets/pre_rendered"
+    use_latent_cache: bool = False
+    latent_cache_dir: str = "datasets/pre_rendered_latents"
     cache_dir: str = "./cache"
     load_text_embeddings: bool = True
     enable_disk_cache: bool = True
@@ -215,7 +221,9 @@ def get_strategy(config: TrainingConfig):
             broadcast_buffers=False,
         )
     elif strategy_name == "fsdp":
+        from cosmos_predict2._src.predict2.networks.minimal_v4_dit import Block
         return FSDPStrategy(
+            auto_wrap_policy={Block},
             use_orig_params=True,
             cpu_offload=False,
             activation_checkpointing_policy=None,
@@ -230,7 +238,7 @@ def get_strategy(config: TrainingConfig):
 
 def get_datamodule(config: TrainingConfig) -> PreRenderedDataModule:
     """
-    Create datamodule instance for pre-rendered 93-view 360° rotation projections.
+    Create datamodule instance for pre-rendered 93-view 360° rotation projections or pre-encoded latents.
 
     Args:
         config: Training configuration object.
@@ -239,13 +247,18 @@ def get_datamodule(config: TrainingConfig) -> PreRenderedDataModule:
         PreRenderedDataModule instance.
     """
     logger.info(
-        f"Creating PreRenderedDataModule with dataset path {config.dataset_path}, batch size {config.batch_size}"
+        f"Creating PreRenderedDataModule with dataset path {config.dataset_path}, use_latent_cache={config.use_latent_cache}, batch size {config.batch_size}"
     )
 
     return PreRenderedDataModule(
         dataset_path=config.dataset_path,
+        use_latent_cache=config.use_latent_cache,
+        latent_cache_dir=config.latent_cache_dir,
         batch_size=config.batch_size,
         num_workers=config.num_workers,
+        prefetch_factor=config.prefetch_factor,
+        pin_memory=config.pin_memory,
+        persistent_workers=config.persistent_workers,
         seed=config.seed,
     )
 
@@ -275,6 +288,7 @@ def get_model(config: TrainingConfig) -> CosmosXRay360:
         guidance_scale=config.guidance_scale,
         rf_shift=config.rf_shift,
         model_size=config.model_size,
+        sac_mode=config.sac_mode,
         distributed_strategy=config.strategy,
         ema_sync_every_n_steps=config.ema_sync_every_n_steps,
     )
@@ -287,6 +301,9 @@ def train(config: TrainingConfig):
     Args:
         config: Training configuration object with all settings.
     """
+    if torch.cuda.is_available():
+        torch.cuda.set_device(get_local_rank())
+
     logger.info(f"Starting training with config: {config}")
 
     # Set random seed for reproducibility
@@ -360,6 +377,9 @@ def parse_args():
     parser.add_argument(
         "--model_size", type=str, default="2B", choices=["2B", "7B", "14B"]
     )
+    parser.add_argument(
+        "--sac_mode", type=str, default="predict2_2b_720_aggressive", help="Selective Activation Checkpointing (SAC) mode"
+    )
     parser.add_argument("--checkpoint_path", type=str, default=None)
     parser.add_argument("--tokenizer_path", type=str, default=None)
 
@@ -389,8 +409,10 @@ def parse_args():
     parser.add_argument("--num_gpus", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--accumulate_grad_batches", type=int, default=1)
-    parser.add_argument("--num_workers", type=int, default=6)
-    parser.add_argument("--prefetch_factor", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--prefetch_factor", type=int, default=2)
+    parser.add_argument("--pin_memory", action="store_true", default=True, help="Pin memory in DataLoader")
+    parser.add_argument("--persistent_workers", action="store_true", default=True, help="Keep DataLoader workers active across epochs")
 
     # Distributed strategy
     parser.add_argument(
@@ -413,6 +435,18 @@ def parse_args():
         type=str,
         default="datasets/pre_rendered",
         help="Path to pre-rendered dataset directory containing 'train' and 'test' subdirectories.",
+    )
+    parser.add_argument(
+        "--use_latent_cache",
+        action="store_true",
+        default=False,
+        help="Enable loading pre-encoded Wan2.1 VAE latent tensors z_0 from disk (bypasses VAE encoder).",
+    )
+    parser.add_argument(
+        "--latent_cache_dir",
+        type=str,
+        default="datasets/pre_rendered_latents",
+        help="Directory containing pre-encoded VAE latents (default: datasets/pre_rendered_latents).",
     )
     parser.add_argument("--cache_dir", type=str, default="./cache")
     parser.add_argument("--img_shape", type=int, default=256)

@@ -563,3 +563,18 @@ def download_text_encoder_snapshot() -> str:
     
     # Slow path: download with DDP concurrency control
     return _download_text_encoder_with_lock(snap_dir, done_file)
+
+
+def download_wan_vae_tokenizer() -> str:
+    """
+    Download and cache Wan2.1 VAE tokenizer weights from HuggingFace Hub.
+
+    Returns:
+        str: Local file path to Wan2.1_VAE.pth.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+        return hf_hub_download(repo_id="Wan-AI/Wan2.1-T2V-1.3B", filename="Wan2.1_VAE.pth")
+    except Exception as e:
+        logger.warning(f"Could not download Wan2.1_VAE.pth from HuggingFace Hub: {e}")
+        return ""
