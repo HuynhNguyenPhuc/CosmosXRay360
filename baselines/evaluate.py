@@ -105,7 +105,7 @@ class UnifiedBaselineEvaluator:
 
         logger.info(f"Loaded {len(test_dirs)} test patient cases from {test_dir}\n")
 
-        results: list[tuple[str, float, float, float, float]] = []
+        results: list[tuple[str, float, float, float, float, float]] = []
 
         for name in ["XRaySyn", "MedNeRF", "Dx2CT", "SV-DRR", "PixelNeRF", "NAF"]:
             wrapper = self.baselines.get(name)
@@ -114,11 +114,12 @@ class UnifiedBaselineEvaluator:
                 continue
 
             try:
-                psnr, ssim, lpips_val, avg_time = self._eval_baseline(wrapper, test_dirs)
-                results.append((name, psnr, ssim, lpips_val, avg_time))
+                psnr, ssim, lpips_val, avg_time, avg_frame_time = self._eval_baseline(wrapper, test_dirs)
+                results.append((name, psnr, ssim, lpips_val, avg_time, avg_frame_time))
                 logger.info(
                     f"  {name:<15} | PSNR: {psnr:.2f} dB | SSIM: {ssim:.3f} | "
-                    f"LPIPS: {lpips_val:.3f} | Time: {avg_time:.1f}s | Status: ✓ PASS"
+                    f"LPIPS: {lpips_val:.3f} | Time: {avg_time:.1f}s/pat "
+                    f"({avg_frame_time * 1000:.1f}ms/frame) | Status: ✓ PASS"
                 )
             except Exception as e:
                 logger.error(f"  {name:<15} | Status: ✗ FAIL - {str(e)[:80]}")
@@ -127,32 +128,49 @@ class UnifiedBaselineEvaluator:
 
     def _eval_baseline(
         self, wrapper: object, test_dirs: list[str]
-    ) -> tuple[float, float, float, float]:
+    ) -> tuple[float, float, float, float, float]:
         total_psnr, total_ssim, total_lpips, total_time = 0.0, 0.0, 0.0, 0.0
+        total_frames_timed = 0
         eval_count = 0
 
         for pat_path in test_dirs:
             pa_file = os.path.join(pat_path, "pa.png")
             views_dir = os.path.join(pat_path, "views")
-            if not (os.path.exists(pa_file) and os.path.exists(views_dir)):
+            pt_views_file = os.path.join(pat_path, "views.pt")
+
+            if not (os.path.exists(pa_file) and (os.path.exists(views_dir) or os.path.exists(pt_views_file))):
                 continue
 
             pa_img = Image.open(pa_file).convert("L")
             input_xr = TF.to_tensor(pa_img).unsqueeze(0).to(self.device)
 
-            gt_files = sorted([f for f in os.listdir(views_dir) if f.endswith(".png")])
-            if not gt_files:
+            gt_files = sorted([f for f in os.listdir(views_dir) if f.endswith(".png")]) if os.path.exists(views_dir) else []
+
+            # Check for high-precision float16 binary container first
+            gt_views_tensor = None
+            if os.path.exists(pt_views_file):
+                try:
+                    gt_views_tensor = torch.load(pt_views_file, map_location=self.device, weights_only=True).float()
+                    if gt_views_tensor.dim() == 3:  # [T, H, W] -> [T, 1, H, W]
+                        gt_views_tensor = gt_views_tensor.unsqueeze(1)
+                except Exception as e:
+                    logger.warning(f"Could not load binary views.pt for {pat_path}: {e}")
+                    gt_views_tensor = None
+
+            total_frames = gt_views_tensor.shape[0] if gt_views_tensor is not None else len(gt_files)
+            if total_frames == 0:
                 continue
 
             start_time = time.time()
-            pred_views = wrapper.infer_multi_views(input_xr, azimuths=(0, 360, len(gt_files)))
+            pred_views = wrapper.infer_multi_views(input_xr, azimuths=(0, 360, total_frames))
             total_time += time.time() - start_time
+            total_frames_timed += total_frames
 
             if not pred_views:
                 continue
 
             pat_psnr, pat_ssim, pat_lpips = 0.0, 0.0, 0.0
-            valid_views = min(len(pred_views), len(gt_files))
+            valid_views = min(len(pred_views), total_frames)
 
             for v_idx in range(valid_views):
                 pred_v = pred_views[v_idx]
@@ -160,13 +178,18 @@ class UnifiedBaselineEvaluator:
                     pred_v = pred_v.unsqueeze(0)
                 pred_v = pred_v.to(self.device)
 
-                gt_img = Image.open(os.path.join(views_dir, gt_files[v_idx])).convert("L")
-                gt_v = TF.to_tensor(gt_img).unsqueeze(0).to(self.device)
+                if gt_views_tensor is not None and v_idx < gt_views_tensor.shape[0]:
+                    gt_v = gt_views_tensor[v_idx : v_idx + 1].to(self.device)
+                else:
+                    gt_img = Image.open(os.path.join(views_dir, gt_files[v_idx])).convert("L")
+                    gt_v = TF.to_tensor(gt_img).unsqueeze(0).to(self.device)
 
                 if pred_v.shape != gt_v.shape:
                     pred_v = TF.resize(pred_v, [gt_v.shape[-2], gt_v.shape[-1]])
 
-                pred_norm, gt_norm = normalize_tensor(pred_v), normalize_tensor(gt_v)
+                # Clamp values to [0, 1] without per-frame min-max to preserve physical scale
+                pred_norm = torch.clamp(pred_v, 0.0, 1.0)
+                gt_norm = torch.clamp(gt_v, 0.0, 1.0)
                 pat_psnr += compute_psnr(pred_norm, gt_norm)
                 pat_ssim += compute_ssim(pred_norm, gt_norm)
                 pat_lpips += compute_lpips(pred_norm, gt_norm)
@@ -184,16 +207,23 @@ class UnifiedBaselineEvaluator:
             total_ssim / eval_count,
             total_lpips / eval_count,
             total_time / eval_count,
+            total_time / total_frames_timed if total_frames_timed > 0 else 0.0,
         )
 
-    def _print_results(self, results: list[tuple[str, float, float, float, float]]) -> None:
+    def _print_results(self, results: list[tuple[str, float, float, float, float, float]]) -> None:
         print("\n" + "=" * 80)
         print("📊 PHASE 1 OUT-OF-DISTRIBUTION (OOD) METRICS - NSCLC TEST SPLIT")
         print("=" * 80)
-        print(f"\n{'Method':<20} {'PSNR (dB) ↑':<13} {'SSIM ↑':<9} {'LPIPS ↓':<9} {'Time/Pat ↓':<10}")
-        print("-" * 65)
-        for method, psnr, ssim, lp, t in results:
-            print(f"{method:<20} {psnr:>10.2f}      {ssim:>9.3f}  {lp:>8.3f}  {t:>8.1f}s")
+        print(
+            f"\n{'Method':<20} {'PSNR (dB) ↑':<13} {'SSIM ↑':<9} {'LPIPS ↓':<9} "
+            f"{'Time/Pat ↓':<11} {'Time/Frame ↓':<12}"
+        )
+        print("-" * 80)
+        for method, psnr, ssim, lp, t, ft in results:
+            print(
+                f"{method:<20} {psnr:>10.2f}      {ssim:>9.3f}  {lp:>8.3f}  "
+                f"{t:>9.1f}s  {ft * 1000:>10.1f}ms"
+            )
         print("=" * 80 + "\n")
 
 

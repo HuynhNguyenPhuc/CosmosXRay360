@@ -111,3 +111,20 @@ reused here for consistency, not independently re-derived.
 run at time of this entry -- relaunching `cosmos-worker-2` (XRaySyn only, via
 `scripts/launch_parallel_vms.sh --override cosmos-worker-2=xraysyn`) to confirm the loss no longer goes
 `nan`; update this entry once epoch-level loss values are observed.
+
+---
+
+## 2026-08-11 — Fixed Zero-Range Division NaN in NormLayer and Added Gradient Clipping
+
+**Phase:** 2 (Training Stability & Correctness)  
+**Files:** `baselines/cloned/XraySyn/xraysyn/utils/torch.py`, `baselines/cloned/XraySyn/xraysyn/networks/rdn_meta.py`, `baselines/cloned/XraySyn/xraysyn/loaders/ct2xray_real.py`, `baselines/cloned/XraySyn/xraysyn/models/ct2xray_real_gan_meta.py`  
+**Change:**  
+1. Added `+ 1e-8` epsilon to `inp / (denom + 1e-8)` inside `NormLayer.forward`, `NormToLayer.forward`, and custom `norm()` methods across `torch.py`, `rdn_meta.py`, and `ct2xray_real.py`.  
+2. Added `torch.nn.utils.clip_grad_norm_` (max_norm=1.0) and `not torch.isnan(loss)` checks in `XraySynModel.optimize()` before `self.optimD.step()` and `self.optimG.step()`.  
+**Why:**  
+Inspecting `xraysyn.csv` from the 100-epoch `cosmos-worker-2` run showed `L1` loss decreasing from $0.361$ (epoch 1) to a minimum of $0.041$ (epoch 6), rebounding slightly to $0.068$ (epoch 8), and turning into `NaN` starting at epoch 9 through epoch 100.  
+*Analysis & Context:* The `xraysyn.csv` run predated the deployment of the 2026-08-07 `atten_proj` clamp fix (`torch.clamp(atten_proj, max=50.0)`). Thus, the historical `NaN` at epoch 9 could stem from two potential root causes (or their combination):  
+  - **Flat feature map division by zero:** `out_new = self.norm(out_new.max() - out_new)` in `ct2xray()` / `mat2xray()` passes $0.0$ when `out_new` becomes spatially uniform, causing `NormLayer.forward` to compute $0.0 / 0.0 = \text{NaN}$.  
+  - **Unclamped exponentiation overflow:** `exp(atten_proj)` overflowing to `inf`, leading to $\text{inf} - \text{inf} = \text{NaN}$ in `out_new.max() - out_new`.  
+Adding `1e-8` epsilon ensures $0.0 / (0.0 + 1e-8) = 0.0$ instead of `NaN`, while gradient clipping protects against GAN gradient explosion. Combining `atten_proj` clamping, `NormLayer` epsilon, and gradient clipping guards against both potential failure modes simultaneously.  
+**Verification:** Verified python compilation with `py_compile`. End-to-end loss stability across 100 epochs pending verification on a fresh worker launch with all fixes deployed.

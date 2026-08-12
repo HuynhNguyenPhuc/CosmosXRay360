@@ -46,23 +46,28 @@ def find_layer(module, filter_fcn):
     return found
 
 class NormLayer(nn.Module):
-    def __init__(self):
+    def __init__(self, eps: float = 1e-8):
         super(NormLayer, self).__init__()
+        self.eps = eps
 
     def forward(self, inp):
         # print(inp.shape)
         inp = inp - inp.min()
-        return inp/inp.max()
+        denom = inp.max()
+        return inp / (denom + self.eps)
 
 class NormToLayer(nn.Module):
-    def __init__(self):
+    def __init__(self, eps: float = 1e-8):
         super(NormToLayer, self).__init__()
+        self.eps = eps
 
     def forward(self, inp, ref):
         # print(inp.shape)
         inp = inp - inp.min()
-        inp = inp/inp.max()
-        return inp*(ref.max()-ref.min())+ref.min()
+        denom = inp.max()
+        inp = inp / (denom + self.eps)
+        ref_range = ref.max() - ref.min()
+        return inp * ref_range + ref.min()
 
 class FunctionModel(nn.Module):
     def __init__(self, fcn):

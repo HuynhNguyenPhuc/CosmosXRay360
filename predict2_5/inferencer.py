@@ -498,27 +498,15 @@ class Inferencer:
 
     @staticmethod
     def _scale_image_intensity(image: np.ndarray) -> np.ndarray:
-        """
-        Scale image intensity to [0, 1] range.
+        """Scale image intensity to [0, 1] range using fixed /255 scaling.
 
         Args:
-            image: Input image as a numpy array.
+            image: Input image as a uint8 numpy array.
 
         Returns:
-            Scaled image as a numpy array with values in [0, 1].
+            Scaled image as a numpy array in [0, 1].
         """
-        image = np.asarray(image, dtype=np.float32).copy()
-
-        # Min-max scaling to [0, 1]
-        image_min = float(image.min())
-        image_max = float(image.max())
-
-        if image_max > image_min:
-            image = (image - image_min) / (image_max - image_min)
-        else:
-            image.fill(0.0)
-
-        return image
+        return np.asarray(image, dtype=np.float32).copy() / 255.0
 
     @torch.inference_mode()
     def predict(

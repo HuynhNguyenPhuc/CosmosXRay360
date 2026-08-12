@@ -1,4 +1,4 @@
-# CosmosXRay360 Phase 1 Benchmark Specification
+# CosmosXRay360 Benchmark Specification
 
 This document details the rigorous evaluation protocols, quantitative paradigms, and qualitative testing environments structured to compare our proposed world model, **Cosmos-Predict2.5**, against modern medical novel-view synthesis (NVS) SOTAs.
 

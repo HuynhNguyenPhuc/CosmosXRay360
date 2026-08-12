@@ -256,8 +256,11 @@ class NAFWrapper:
                             mode="bilinear",
                             align_corners=False,
                         ).squeeze(0).squeeze(0)
-                    proj_corrected = normalize_tensor(proj)
-                    results.append(proj_corrected)
+                    results.append(proj)
+
+                # Normalize across the full sequence to preserve inter-view relative intensity
+                if results:
+                    results = list(normalize_tensor(torch.stack(results, dim=0)).unbind(0))
         except Exception as e:
             logger.error(f"[NAF] Inference execution failed: {e}")
         

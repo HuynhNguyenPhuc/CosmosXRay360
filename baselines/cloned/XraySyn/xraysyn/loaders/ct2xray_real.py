@@ -19,7 +19,8 @@ class VolumeLoader(Dataset):
 
     def norm(self, inp):
         inp = inp - inp.min()
-        return inp/inp.max()        
+        denom = inp.max()
+        return inp / (denom + 1e-8)        
 
     def get_random_param(self, flag_in):
         param = np.random.rand(6)

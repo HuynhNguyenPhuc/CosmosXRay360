@@ -182,7 +182,9 @@ class XraySynModel(Base):
         error_real = self.obj_gan_p(real, True)
         loss_D_p = error_fake + error_real
         loss_D_p.backward()
-        self.optimD.step()
+        torch.nn.utils.clip_grad_norm_(self.netD.parameters(), max_norm=1.0)
+        if not torch.isnan(loss_D_p):
+            self.optimD.step()
         self._record_loss("GAN_D", loss_D_p)
 
         fake2 = self.netD(xray2_refine)
@@ -220,4 +222,6 @@ class XraySynModel(Base):
         self._record_loss(f"GAN_G", loss_gan)
         self.optimG.zero_grad()
         loss.backward()
-        self.optimG.step()
+        torch.nn.utils.clip_grad_norm_(self.net2d.parameters(), max_norm=1.0)
+        if not torch.isnan(loss):
+            self.optimG.step()

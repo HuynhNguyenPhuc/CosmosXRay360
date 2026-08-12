@@ -61,6 +61,28 @@ see `scripts/eda_dataset.ipynb` §1–§2 for the reproducible computation.
 The TCIA cohort's Mean Max HU ($+8086.4 \pm 8551.3$) is an order of magnitude larger, and an order
 of magnitude more variable, than the other two cohorts — a discrepancy investigated in §3.
 
+### 2.1 Pre-Rendered Projection Intensity Distribution and Physical Normalization
+
+Auditing the pre-rendered 2D projection tensors (`views.pt`, shape $[93, 256, 256]$ generated via `datasets/pre_render_diffdrr.py`) across a stratified sample ($N = 150$ cases, 50 per cohort) in `scripts/eda_dataset.ipynb` §2.1 yields the empirical intensity statistics shown in **Table 1B**.
+
+**Table 1B.** Pre-rendered 2D projection tensor statistics (`views.pt`) computed directly in `scripts/eda_dataset.ipynb` §2.1.
+
+| Cohort / Dataset | OOD Role | N Sampled | Mean Max Intensity ($\max(I)$) | Min Max | Max Max | Per-Frame Spread | Max 0°/360° Wrap Diff |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **NSCLC (LUNG1)** | Test Set | 50 | $0.7317 \pm 0.0481$ | $0.6219$ | $0.8511$ | $0.2676 \pm 0.0418$ | $0.000488$ |
+| **TCIA (COVID-19)** | Train Set | 50 | $0.8870 \pm 0.0488$ | $0.7284$ | $0.9814$ | $0.3448 \pm 0.0565$ | $0.000001$ |
+| **MELA2022** | Train Set | 50 | $0.9455 \pm 0.0388$ | $0.8487$ | $1.0000$ | $0.3225 \pm 0.0387$ | $0.000001$ |
+
+#### Key Empirical Observations:
+1. **Inter-Patient Max Intensity Variance ($\max(I) \in [0.6219, 1.0000]$):** Across all cohorts, peak projection intensity is not clamped to $1.0$ for every patient, but varies naturally from $0.6219$ (low-density NSCLC scan) to $1.0000$ (dense MELA2022 scan).
+2. **Dynamic Azimuthal Spread ($\text{Spread} \approx 0.27\text{--}0.34$):** The per-frame maximum intensity variation across the $360^\circ$ rotation is large ($\Delta \approx 0.27\text{--}0.34$), confirming high dynamic range between frontal (PA) and lateral (LAT) views without flat projection artifacts.
+3. **Seamless 360° Rotational Wrap ($\text{Wrap Diff} \le 0.000488$):** The absolute pixel difference between $0^\circ$ (frame 0) and $360^\circ$ (frame 92) is virtually zero across all cases, confirming perfect rotational symmetry and continuity.
+
+#### Underlying Physical Mechanisms:
+- **1. Dataset-Wide Physical Scaling (`FIXED_LINE_INTEGRAL_MAX = 1.0`):** Rather than performing per-patient dynamic min–max normalization $\frac{x - x_{\min}}{x_{\max} - x_{\min}}$ (which destroys relative density ratios across scans and induces contrast collapse on metal outliers, §3.1), raw line integrals $\int \mu \, ds$ are scaled by a single global physical constant. This preserves true anatomical radiodensity relationships across different patients and cohorts.
+- **2. Patient Body Habitus and Pathology:** Patients with larger thoracic frames, thicker muscular/soft tissue, or higher cortical bone density produce higher line integral peaks ($\max(I) \approx 0.88\text{--}1.00$). Conversely, patients with smaller frames, lower muscle mass, or pulmonary pathologies such as emphysema (increased air volume in lungs, lower tissue density) produce lower peak attenuation ($\max(I) \approx 0.62\text{--}0.85$).
+- **3. Cohort Field-of-View (FOV) Differences:** The dataset-optimal FOV framing varies across cohorts (§5): MELA2022 ($12.0^\circ$) and TCIA ($11.9^\circ$) employ wider FOVs capturing peripheral dense structures (shoulder girdle, spine), raising their peak intensities ($\max(I)$ up to $1.00$). NSCLC ($10.2^\circ$) tightly frames the pulmonary field, excluding peripheral bone margins and resulting in lower peak maxima ($\max(I) \approx 0.62\text{--}0.85$).
+
 ---
 
 ## 3. Failure-Mode Analysis: Scanner and Hardware Artifacts

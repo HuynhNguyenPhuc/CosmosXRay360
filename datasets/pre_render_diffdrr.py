@@ -23,7 +23,7 @@ from PIL import Image
 BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
-from renderers.diffdrr.renderer import create_diffdrr_renderer
+from renderers.diffdrr.renderer import FIXED_LINE_INTEGRAL_MAX, create_diffdrr_renderer
 from renderers.diffdrr.data import load_ct_volume
 
 logging.basicConfig(
@@ -95,43 +95,14 @@ def pre_render_ct(
         renderer = create_diffdrr_renderer(img_shape=img_shape, device=device)
         renderer.set_volume(vol)
 
-        # 1. Render PA view (azimuth = 0.0)
-        logger.info("Rendering PA view (0°)...")
-        pa_tensor = renderer.render(
-            azimuth=torch.tensor([0.0], device=device),
-            elev=elev,
-            dist=dist,
-            fov=fov,
-            min_depth=min_depth,
-            max_depth=max_depth,
-            norm_type="standardized",
-        )
-        # pa_tensor is [1, 1, H, W]
-        pa_np = (pa_tensor[0, 0].cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
-        Image.fromarray(pa_np, mode="L").save(pa_path)
-
-        # 2. Render LAT view (azimuth = 90.0)
-        logger.info("Rendering Lateral view (90°)...")
-        lat_tensor = renderer.render(
-            azimuth=torch.tensor([90.0], device=device),
-            elev=elev,
-            dist=dist,
-            fov=fov,
-            min_depth=min_depth,
-            max_depth=max_depth,
-            norm_type="standardized",
-        )
-        lat_np = (lat_tensor[0, 0].cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
-        Image.fromarray(lat_np, mode="L").save(lat_path)
-
-        # 3. Render 360-degree azimuth sweep for baseline training/eval proxies
-        logger.info(f"Rendering 360° sweep ({num_frames} frames)...")
+        # Render 360-degree azimuth sweep as raw un-normalized line integrals (norm_type=None)
+        logger.info(f"Rendering 360° sweep ({num_frames} frames raw line integrals)...")
         azimuths = torch.linspace(0.0, 360.0, num_frames, device=device)
         
-        # Render one by one to keep VRAM usage extremely low (~1GB)
-        chunk_size = 1
+        raw_frames_list = []
+        chunk_size = 1  # Render one by one to keep VRAM usage extremely low (~1GB)
         for i in range(0, num_frames, chunk_size):
-            chunk_azimuths = azimuths[i:i+chunk_size]
+            chunk_azimuths = azimuths[i : i + chunk_size]
             chunk_frames = renderer.render(
                 azimuth=chunk_azimuths,
                 elev=elev,
@@ -139,19 +110,40 @@ def pre_render_ct(
                 fov=fov,
                 min_depth=min_depth,
                 max_depth=max_depth,
-                norm_type="standardized",
+                norm_type=None,  # Un-normalized raw line integrals
                 batch_size=chunk_size,
             )  # [batch, 1, H, W]
+            raw_frames_list.append(chunk_frames.cpu())
             
-            for j in range(chunk_frames.shape[0]):
-                frame_idx = i + j
-                frame_np = (chunk_frames[j, 0].cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
-                frame_path = views_dir / f"{frame_idx:03d}.png"
-                Image.fromarray(frame_np, mode="L").save(frame_path)
-            
-            # Explicitly empty cache to keep memory footprint minimal
             if device.startswith("cuda"):
                 torch.cuda.empty_cache()
+
+        all_raw = torch.cat(raw_frames_list, dim=0)  # Shape: [93, 1, H, W]
+
+        # Dataset-wide physical scaling with the fixed constant defined once in
+        # renderers/diffdrr/renderer.py, to preserve relative attenuation ratios.
+        norm_frames = torch.clamp(all_raw / FIXED_LINE_INTEGRAL_MAX, 0.0, 1.0)  # Shape: [93, 1, H, W]
+
+        # 1. Save PA view (0.0°) and LAT view (90.0°)
+        pa_np = (norm_frames[0, 0].numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        Image.fromarray(pa_np, mode="L").save(pa_path)
+
+        lat_idx = int(round(90.0 / (360.0 / (num_frames - 1))))
+        lat_np = (norm_frames[lat_idx, 0].numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        Image.fromarray(lat_np, mode="L").save(lat_path)
+
+        # 2. Save individual PNG views
+        for frame_idx in range(num_frames):
+            frame_np = (norm_frames[frame_idx, 0].numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            frame_path = views_dir / f"{frame_idx:03d}.png"
+            Image.fromarray(frame_np, mode="L").save(frame_path)
+
+        # 3. Save single binary float32 tensor container (views.pt); strip MONAI MetaTensor subclass for safe loading
+        pt_tensor = norm_frames.squeeze(1)
+        if hasattr(pt_tensor, "as_tensor"):
+            pt_tensor = pt_tensor.as_tensor()
+        pt_path = output_patient_dir / "views.pt"
+        torch.save(pt_tensor, pt_path)
 
         logger.info(f"Successfully processed and pre-rendered CT volume: {ct_path}")
         return True

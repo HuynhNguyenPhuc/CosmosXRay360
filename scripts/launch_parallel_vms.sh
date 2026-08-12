@@ -42,7 +42,7 @@ declare -A WORKER_OVERRIDE          # worker_name -> "baseline1[,baseline2]"
 declare -A ONLY_WORKERS             # worker_name -> 1 (filter launched workers)
 # Extra CLI args per baseline (appended after --epochs)
 declare -A BASELINE_EXTRA_ARGS=(
-    [svdrr]="--patience 50 --batch_size 4 --accum_steps 16"
+    [svdrr]="--patience 50 --batch_size 8 --accum_steps 8"
 )
 # Instance template per worker (default: L4 template; worker-4 defaults to dedicated A100 template)
 declare -A WORKER_TEMPLATE_OVERRIDE=(
@@ -261,7 +261,7 @@ if [ ! -d "datasets/TCIA" ] || [ ! -d "datasets/MELA2022" ]; then
         -e HF_TOKEN="$HF_TOKEN" \
         -v \$(pwd)/datasets:/workspace/datasets \
         cosmos_baselines \
-        python3 scripts/fast_download.py --percentage 1.0 --max_workers $DOWNLOAD_MAX_WORKERS
+        python3 scripts/fast_download.py --percentage 1.0 --max_workers $DOWNLOAD_MAX_WORKERS || true
 fi
 
 # Execute assigned Baseline 1
@@ -292,8 +292,12 @@ EOF
         STARTUP_SCRIPT_FILE="$(mktemp)"
         printf '%s' "$STARTUP_SCRIPT" > "$STARTUP_SCRIPT_FILE"
 
-        # Candidate zones with L4 GPU availability to try in case of stockout
-        CANDIDATE_ZONES=("us-east1-c" "us-west1-a" "us-east1-d" "us-east1-b" "us-west1-b" "us-west1-c" "us-central1-a" "us-central1-b" "us-central1-c" "europe-west1-b")
+        # Candidate zones tailored by accelerator type (A100 vs L4) to avoid invalid machine-type errors
+        if [[ "$WORKER_TEMPLATE" == *"a100"* ]]; then
+            CANDIDATE_ZONES=("us-central1-a" "us-central1-b" "us-central1-c" "us-central1-f" "us-east1-b" "us-west1-b" "europe-west4-a" "europe-west4-b" "asia-southeast1-a" "asia-northeast1-a")
+        else
+            CANDIDATE_ZONES=("us-east1-c" "us-west1-a" "us-east1-d" "us-east1-b" "us-west1-b" "us-west1-c" "us-central1-a" "us-central1-b" "us-central1-c" "europe-west1-b")
+        fi
         LAUNCH_SUCCESS=false
 
         # First check if the VM is already running in any candidate zone

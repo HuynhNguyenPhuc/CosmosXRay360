@@ -1,4 +1,4 @@
-# nanoCosmos-Style Batch Walkthrough: `WALKTHROUGH.md`
+# Walkthrough
 
 This document details exactly what happens when running a single inference or training batch through the adapted **Cosmos-Predict2.5** framework. It traces execution chronologically from input loading to 360-degree novel-view projection.
 
