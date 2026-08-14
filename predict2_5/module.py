@@ -112,6 +112,9 @@ class CosmosXRay360(LightningModule):
         # When >= 0, sets a very low noise level for cond frames (e.g., 0.0 = clean)
         conditional_frame_timestep: float = -1.0,
         sac_mode: str = "predict2_2b_720_aggressive",
+        # Physics & Geometric regularization
+        gamma_side: float = 1.0,
+        loss_atten_weight: float = 0.02,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -276,12 +279,19 @@ class CosmosXRay360(LightningModule):
                     logger.warning(f"DiT checkpoint download failed ({exc}). Model initialized with random weights.")
 
         if checkpoint_path and os.path.exists(checkpoint_path):
-            state_dict = torch.load(checkpoint_path, map_location="cpu")
-            if "net." in list(state_dict.keys())[0]:
+            ckpt = torch.load(checkpoint_path, map_location="cpu")
+            if isinstance(ckpt, dict) and "net" in ckpt:
+                state_dict = ckpt["net"]
+            elif isinstance(ckpt, dict) and "state_dict" in ckpt:
+                state_dict = ckpt["state_dict"]
+            else:
+                state_dict = ckpt
+
+            if isinstance(state_dict, dict):
                 state_dict = {
-                    k.replace("net.", ""): v
+                    k.replace("._checkpoint_wrapped_module", "").removeprefix("net."): v
                     for k, v in state_dict.items()
-                    if k.startswith("net.")
+                    if not any(k.startswith(p) for p in ["prompt_encoder.", "tokenizer."])
                 }
             _ = non_strict_load_model(self.net, state_dict)
         else:
@@ -624,10 +634,16 @@ class CosmosXRay360(LightningModule):
                 )
                 timesteps_B_T = timesteps_B_T.view(B, T)
 
+        target_device = next(self.net.parameters()).device
+        cond_dict = condition.to_dict()
+        for k, v in cond_dict.items():
+            if isinstance(v, torch.Tensor):
+                cond_dict[k] = v.to(device=target_device)
+
         net_output_B_C_T_H_W = self.net(
-            x_B_C_T_H_W=xt_B_C_T_H_W.to(device=self.device, dtype=model_dtype),
-            timesteps_B_T=timesteps_B_T.to(device=self.device, dtype=model_dtype),
-            **condition.to_dict(),
+            x_B_C_T_H_W=xt_B_C_T_H_W.to(device=target_device, dtype=model_dtype),
+            timesteps_B_T=timesteps_B_T.to(device=target_device, dtype=model_dtype),
+            **cond_dict,
         ).float()
 
         # Replace velocity for conditioning frames with GT
@@ -882,6 +898,52 @@ class CosmosXRay360(LightningModule):
         if get_local_rank() == 0:
             logger.info("Training started (step=0)")
 
+    def _compute_physical_losses(
+        self,
+        vt_pred_B_C_T_H_W: torch.Tensor,
+        vt_B_C_T_H_W: torch.Tensor,
+        xt_B_C_T_H_W: torch.Tensor,
+        sigmas: torch.Tensor,
+        timesteps: torch.Tensor,
+        tensor_kwargs: dict,
+        x1_gt: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute angular-offset weighted velocity matching loss and global attenuation mass loss.
+        """
+        B, C, T, H, W = vt_pred_B_C_T_H_W.shape
+
+        # 1. Angular-Offset Weighted Loss (w(theta_k) = 1 + gamma_side * sin^2(theta_k))
+        gamma_side = getattr(self.hparams, "gamma_side", 1.0)
+        angles = torch.linspace(0.0, 2.0 * np.pi, T, device=vt_pred_B_C_T_H_W.device, dtype=torch.float32)
+        w_theta = (1.0 + gamma_side * (torch.sin(angles) ** 2)).view(1, 1, T, 1, 1)
+
+        sq_err = (vt_pred_B_C_T_H_W - vt_B_C_T_H_W) ** 2
+        weighted_sq_err = sq_err * w_theta
+
+        per_instance_loss = torch.mean(
+            weighted_sq_err,
+            dim=list(range(1, vt_pred_B_C_T_H_W.dim())),
+        )
+        time_weights_B = self.rectified_flow.train_time_weight(timesteps, tensor_kwargs)
+        loss_angle_rf = torch.mean(time_weights_B.view(-1) * per_instance_loss)
+
+        # 2. Line-Integral Global Attenuation Mass Loss (L_atten)
+        # Always anchor D_pa to ground-truth PA frame from x1_gt (x1_gt[:, :, 0:1]) if available
+        sigmas_5d = sigmas.view(B, 1, 1, 1, 1)
+        x0_pred = xt_B_C_T_H_W - sigmas_5d * vt_pred_B_C_T_H_W
+        D_pred = torch.mean(x0_pred, dim=[1, 3, 4])  # [B, T]
+        if x1_gt is not None:
+            D_pa = torch.mean(x1_gt[:, :, 0:1], dim=[1, 3, 4])  # [B, 1] GT PA attenuation mass
+        else:
+            D_pa = D_pred[:, 0:1]
+        loss_atten = torch.mean((D_pred - D_pa) ** 2)
+
+        loss_atten_weight = getattr(self.hparams, "loss_atten_weight", 0.02)
+        total_loss = loss_angle_rf + loss_atten_weight * loss_atten
+
+        return total_loss, loss_angle_rf, loss_atten, per_instance_loss
+
     def training_step(self, batch: dict, batch_idx: int) -> dict:
         """Training step with rectified flow loss."""
         result = self._process_batch(batch, stage="train")
@@ -934,21 +996,33 @@ class CosmosXRay360(LightningModule):
             condition=condition,
         )
 
-        # Compute loss
-        time_weights_B = self.rectified_flow.train_time_weight(timesteps, tensor_kwargs)
-        per_instance_loss = torch.mean(
-            (vt_pred_B_C_T_H_W - vt_B_C_T_H_W) ** 2,
-            dim=list(range(1, vt_pred_B_C_T_H_W.dim())),
+        total_loss, loss_angle_rf, loss_atten, per_instance_loss = self._compute_physical_losses(
+            vt_pred_B_C_T_H_W, vt_B_C_T_H_W, xt_B_C_T_H_W, sigmas, timesteps, tensor_kwargs, x1_gt=x_1
         )
-        loss = torch.mean(time_weights_B.view(-1) * per_instance_loss)
 
         # Log training metrics
         self.log(
             "train/loss",
-            loss,
+            total_loss,
             on_step=False,
             on_epoch=True,
             prog_bar=True,
+            sync_dist=True,
+            batch_size=B,
+        )
+        self.log(
+            "train/loss_angle_rf",
+            loss_angle_rf,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=B,
+        )
+        self.log(
+            "train/loss_atten",
+            loss_atten,
+            on_step=False,
+            on_epoch=True,
             sync_dist=True,
             batch_size=B,
         )
@@ -990,10 +1064,10 @@ class CosmosXRay360(LightningModule):
             "x_1": x_1.detach().cpu(),
             "v_pred": vt_pred_B_C_T_H_W.detach().cpu(),
             "sigma": sigmas.detach().cpu(),
-            "loss": loss.detach().cpu(),
+            "loss": total_loss.detach().cpu(),
         }
 
-        return {"loss": loss, "output_batch": output_batch}
+        return {"loss": total_loss, "output_batch": output_batch}
 
     def validation_step(self, batch: dict, batch_idx: int) -> dict:
         """Validation step using EMA model."""
@@ -1044,18 +1118,14 @@ class CosmosXRay360(LightningModule):
                 condition=condition,
             )
 
-        # Compute loss
-        time_weights_B = self.rectified_flow.train_time_weight(timesteps, tensor_kwargs)
-        per_instance_loss = torch.mean(
-            (vt_pred_B_C_T_H_W - vt_B_C_T_H_W) ** 2,
-            dim=list(range(1, vt_pred_B_C_T_H_W.dim())),
+        total_loss, loss_angle_rf, loss_atten, per_instance_loss = self._compute_physical_losses(
+            vt_pred_B_C_T_H_W, vt_B_C_T_H_W, xt_B_C_T_H_W, sigmas, timesteps, tensor_kwargs, x1_gt=x_1
         )
-        loss = torch.mean(time_weights_B.view(-1) * per_instance_loss)
 
         # Log validation metrics (EMA-based)
         self.log(
             "val/loss",
-            loss,
+            total_loss,
             on_step=False,
             on_epoch=True,
             prog_bar=True,
@@ -1064,10 +1134,26 @@ class CosmosXRay360(LightningModule):
         )
         self.log(
             "val_loss",
-            loss,
+            total_loss,
             on_step=False,
             on_epoch=True,
             logger=False,
+            sync_dist=True,
+            batch_size=B,
+        )
+        self.log(
+            "val/loss_angle_rf",
+            loss_angle_rf,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=B,
+        )
+        self.log(
+            "val/loss_atten",
+            loss_atten,
+            on_step=False,
+            on_epoch=True,
             sync_dist=True,
             batch_size=B,
         )
@@ -1093,10 +1179,10 @@ class CosmosXRay360(LightningModule):
             "x_1": x_1.detach().cpu(),
             "v_pred": vt_pred_B_C_T_H_W.detach().cpu(),
             "sigma": sigmas.detach().cpu(),
-            "loss": loss.detach().cpu(),
+            "loss": total_loss.detach().cpu(),
         }
 
-        return {"loss": loss, "output_batch": output_batch}
+        return {"loss": total_loss, "output_batch": output_batch}
 
     @torch.inference_mode()
     def generate(

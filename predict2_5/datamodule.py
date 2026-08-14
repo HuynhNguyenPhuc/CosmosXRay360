@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 from typing import Any, Optional, Union
 
 from PIL import Image
+import numpy as np
 
 import torch
 from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms.functional as TF
 
 from lightning import LightningDataModule, seed_everything
+
+# Ensure repo root is on sys.path for direct execution
+_BASE_DIR = Path(__file__).resolve().parents[1]
+if str(_BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(_BASE_DIR))
 
 from predict2_5.constants import NUM_FRAMES, PROMPTS
 from predict2_5.utils import get_logger
@@ -77,7 +84,9 @@ class PreRendered360Dataset(Dataset):
             if self.data_dir.exists():
                 self.patient_paths = sorted([
                     p for p in self.data_dir.iterdir()
-                    if p.is_dir() and (p / "views").exists()
+                    if p.is_dir() and (
+                        (p / "views").exists() or (p / "views.pt").exists() or (p / "views.npy").exists()
+                    )
                 ])
             else:
                 self.patient_paths = []
@@ -125,8 +134,11 @@ class PreRendered360Dataset(Dataset):
                 video_tensor = video_tensor.float() / 255.0
             if video_tensor.dim() == 3:  # [T, H, W] -> [1, T, H, W]
                 video_tensor = video_tensor.unsqueeze(0)
-            elif video_tensor.dim() == 4 and video_tensor.shape[0] == 3:  # [3, T, H, W] -> [1, T, H, W]
-                video_tensor = video_tensor[:1]  # Keep 1 channel, expand on GPU
+            elif video_tensor.dim() == 4:
+                if video_tensor.shape[1] == 1 and video_tensor.shape[0] != 1:  # [T, 1, H, W] -> [1, T, H, W]
+                    video_tensor = video_tensor.permute(1, 0, 2, 3)
+                elif video_tensor.shape[0] == 3:  # [3, T, H, W] -> [1, T, H, W]
+                    video_tensor = video_tensor[:1]  # Keep 1 channel, expand on GPU
         elif npy_views_path.exists():
             # Fast binary NumPy array read
             arr = np.load(npy_views_path)
@@ -135,8 +147,11 @@ class PreRendered360Dataset(Dataset):
                 video_tensor = video_tensor.float() / 255.0
             if video_tensor.dim() == 3:  # [T, H, W] -> [1, T, H, W]
                 video_tensor = video_tensor.unsqueeze(0)
-            elif video_tensor.dim() == 4 and video_tensor.shape[0] == 3:
-                video_tensor = video_tensor[:1]
+            elif video_tensor.dim() == 4:
+                if video_tensor.shape[1] == 1 and video_tensor.shape[0] != 1:  # [T, 1, H, W] -> [1, T, H, W]
+                    video_tensor = video_tensor.permute(1, 0, 2, 3)
+                elif video_tensor.shape[0] == 3:
+                    video_tensor = video_tensor[:1]
         else:
             # Fallback to multi-view PNG loading (single channel output, expanded on GPU)
             views_dir = patient_path / "views"
@@ -232,7 +247,8 @@ class PreRenderedLatentDataset(Dataset):
 
         if patient_dirs is not None:
             self.patient_paths = [
-                self.latent_dir / p for p in patient_dirs if (self.latent_dir / p).is_dir()
+                self.latent_dir / p for p in patient_dirs
+                if (self.latent_dir / p).is_dir() and (self.latent_dir / p / "latent.pt").exists()
             ]
         else:
             if self.latent_dir.exists():
@@ -269,6 +285,8 @@ class PreRenderedLatentDataset(Dataset):
         pa_path = patient_path / "pa.png"
         if not pa_path.exists() and self.data_dir != self.latent_dir:
             pa_path = self.data_dir / patient_id / "pa.png"
+        if not pa_path.exists() and (self.data_dir / patient_id / "views" / "000.png").exists():
+            pa_path = self.data_dir / patient_id / "views" / "000.png"
 
         if pa_path.exists():
             pa_img = Image.open(pa_path).convert("L")
@@ -369,7 +387,9 @@ class PreRenderedDataModule(LightningDataModule):
                 all_patients = sorted([
                     p.name
                     for p in self.train_dir.iterdir()
-                    if p.is_dir() and (p / "views").exists()
+                    if p.is_dir() and (
+                        (p / "views").exists() or (p / "views.pt").exists() or (p / "views.npy").exists() or (p / "latent.pt").exists()
+                    )
                 ])
             else:
                 all_patients = []
@@ -494,10 +514,10 @@ class PreRenderedDataModule(LightningDataModule):
             **kwargs,
         )
 
-    def test_dataloader(self) -> DataLoader:
+    def test_dataloader(self) -> DataLoader | list:
         """Create test dataloader."""
         if self.test_dataset is None or len(self.test_dataset) == 0:
-            return None
+            return []
 
         return DataLoader(
             self.test_dataset,

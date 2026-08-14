@@ -121,8 +121,8 @@ class TensorBoardCallback(Callback):
                 # Already stored validation batch, skip to avoid overwriting
                 return
             
-            if batch.get("video") is None:
-                # No video data in batch, skip storing
+            if batch.get("video") is None and batch.get("pre_cached_latent") is None and batch.get("latent") is None:
+                # No video or latent data in batch, skip storing
                 return
             
             # Store a copy of the batch on CPU for logging
@@ -252,16 +252,27 @@ class TensorBoardCallback(Callback):
         # Get current epoch for logging step
         epoch = trainer.current_epoch
         
-        has_video = data.get('video') is not None
-        if not has_video:
-            # No video data to log, skip logging for this batch
-            return
+        gt_video_tensor = data.get('video')
+        if gt_video_tensor is not None:
+            gt_video = gt_video_tensor[0].float()
+        else:
+            latent = data.get('pre_cached_latent')
+            if latent is None:
+                latent = data.get('latent')
+            if latent is not None and hasattr(pl_module, 'decode') and getattr(pl_module, 'tokenizer', None) is not None:
+                try:
+                    with torch.no_grad():
+                        latent_sample = latent[0:1].to(pl_module.device)
+                        decoded = pl_module.decode(latent_sample).cpu().float()
+                        gt_video = (decoded[0] + 1.0) / 2.0  # scale [-1, 1] to [0, 1]
+                except Exception as e:
+                    if get_local_rank() == 0:
+                        logger.warning("Could not decode pre_cached_latent for GT logging: %s", e)
+                    return
+            else:
+                return
 
         try:
-            # Get the ground truth video
-            # Multi-view X-Ray images are stored as a single video
-            gt_video = data['video'][0].float()  # (C, T, H, W)
-
             # Permute to (T, C, H, W) to become a list of frames for later processing
             gt_frames = gt_video.permute(1, 0, 2, 3)  # (T, C, H, W)
             
@@ -348,8 +359,20 @@ class TensorBoardCallback(Callback):
             except Exception:
                 pass  # Older PyTorch versions may not support this
             
-            # Get ground truth video from data dict, move to GPU if available
-            gt_video = data['video'].to(device, non_blocking=True)
+            # Get ground truth video from data dict, or decode pre_cached_latent
+            gt_video = data.get('video')
+            if gt_video is not None:
+                gt_video = gt_video.to(device, non_blocking=True)
+            else:
+                latent = data.get('pre_cached_latent')
+                if latent is None:
+                    latent = data.get('latent')
+                if latent is not None and hasattr(pl_module, 'decode') and getattr(pl_module, 'tokenizer', None) is not None:
+                    latent_sample = latent[0:1].to(device)
+                    decoded = pl_module.decode(latent_sample)
+                    gt_video = (decoded + 1.0) / 2.0
+                else:
+                    return None
 
             # Get text embeddings from data dict, move to GPU if available
             text_embeddings = data.get('text_embeddings')
@@ -456,8 +479,11 @@ class EMAMonitorCallback(Callback):
             
         try:
             # Log EMA beta
-            if hasattr(pl_module, '_get_ema_beta'):
-                shift = pl_module.hparams.ema_iteration_shift
+            if hasattr(pl_module, 'ema_beta'):
+                beta = pl_module.ema_beta(trainer.global_step)
+                pl_module.log("ema/beta", beta, prog_bar=False)
+            elif hasattr(pl_module, '_get_ema_beta'):
+                shift = getattr(pl_module.hparams, "ema_iteration_shift", 0)
                 effective_step = trainer.global_step - shift + 1
                 if effective_step >= 1:
                     beta = pl_module._get_ema_beta(effective_step)

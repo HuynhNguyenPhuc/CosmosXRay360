@@ -73,8 +73,9 @@ This document provides the complete, structured deconstruction of all reviewer c
 * **Vietnamese Analysis:**
   * Tạo chuỗi góc nhìn từ 1 ảnh đơn là rất khó (PSNR ~23.26dB). Reviewer yêu cầu thảo luận cách cải thiện (multi-step rollout, sparse priors) và rủi ro/cạm bẫy (hallucinations).
 * **Technical Action Plan:**
-  * **Sequential Causal Rollouts:** Formulate sliding-window autoregressive conditioning $\hat{P}_{\theta_t} = G(P_{\theta_0}, \hat{P}_{\theta_{t-1}}, \dots, \hat{P}_{\theta_{t-k}})$.
-  * **Hallucination Clamping:** Detail how the **Frame-Token Replacement Mechanism** ($z_{t_{\text{frontal}}} \leftarrow z_{\text{frontal}}$) acts as a hard boundary condition to clamp generative drift and prevent fake clinical pathology synthesis (`PROPOSAL.md` Section 4).
+  * **Joint Single-Pass vs. Sequential Rollout Positioning:** Contrast sequential autoregressive rollouts (4x latency, cumulative error drift) with Cosmos-Predict2.5's **Joint 3D-RoPE Single-Pass Generation** (single 35-step forward pass, global spatiotemporal attention, zero error accumulation).
+  * **Multi-View Prior Extension (Bi-View PA+LAT):** Support Dual-Anchor conditioning ($M_{0^\circ} = 1, M_{90^\circ} = 1$) when orthogonal views are available to eliminate depth ambiguity.
+  * **Medical Pitfalls & Clamping:** Detail 3 medical pitfalls in Discussion: (1) Anatomical Hallucinations (clamped via Frame-Token Replacement & $\mathcal{L}_{\text{atten}}$ mass loss); (2) Cone-beam Cardiac Magnification (handled via $180^\circ$ AP Soft Feature Prior $\alpha=0.3$); (3) Tuy-Smith Sufficiency limits in single-orbit 3D CT reconstruction.
 
 ### 2.3 Concern R3-3: Physical Domain Gaps Between DRRs and CXRs
 * **Verbatim Reviewer Quote:**

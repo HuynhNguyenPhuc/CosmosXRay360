@@ -1,4 +1,4 @@
-"""HuggingFace download helpers for CosmosXRay2XRay."""
+"""HuggingFace download helpers for CosmosXRay360."""
 
 import os
 import json

@@ -5,9 +5,18 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import os
+import sys
 import logging
 import argparse
 from datetime import datetime
+from pathlib import Path
+
+# Ensure repo root is on sys.path for direct/torchrun execution (`torchrun ... predict2_5/trainer.py`
+# puts this file's own directory on sys.path[0], not the repo root, so the `predict2_5` package
+# itself wouldn't otherwise be importable).
+_BASE_DIR = Path(__file__).resolve().parents[1]
+if str(_BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(_BASE_DIR))
 
 import torch
 from lightning.pytorch import Trainer, seed_everything
@@ -64,6 +73,10 @@ class TrainingConfig:
     rf_shift: float = 5.0
     num_inference_steps: int = 35
     guidance_scale: float = 1.5
+
+    # Physics & Geometric regularization
+    gamma_side: float = 1.0
+    loss_atten_weight: float = 0.02
 
     # Hardware
     precision: str = "bf16-mixed"
@@ -291,6 +304,8 @@ def get_model(config: TrainingConfig) -> CosmosXRay360:
         sac_mode=config.sac_mode,
         distributed_strategy=config.strategy,
         ema_sync_every_n_steps=config.ema_sync_every_n_steps,
+        gamma_side=config.gamma_side,
+        loss_atten_weight=config.loss_atten_weight,
     )
 
 
@@ -388,6 +403,20 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=0.001)
     parser.add_argument("--warmup_steps", type=int, default=2000)
     parser.add_argument("--max_iters", type=int, default=100000)
+
+    # Physics & Geometric regularization
+    parser.add_argument(
+        "--gamma_side",
+        type=float,
+        default=1.0,
+        help="Angular-offset loss weight w(theta_k) = 1 + gamma_side * sin^2(theta_k); 0.0 disables angular weighting (ablation Variant A/baseline).",
+    )
+    parser.add_argument(
+        "--loss_atten_weight",
+        type=float,
+        default=0.02,
+        help="Weight lambda_atten for the global attenuation mass loss L_atten; 0.0 disables it (ablation Variants A/B/C).",
+    )
 
     # EMA configuration
     parser.add_argument("--enable_ema", action="store_true", default=True)
