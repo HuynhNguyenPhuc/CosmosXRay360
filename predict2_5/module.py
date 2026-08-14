@@ -135,16 +135,16 @@ class CosmosXRay360(LightningModule):
 
     @property
     def net_ema(self) -> Optional[MinimalV1LVGDiT]:
-        """Return net_ema stored in __dict__ to prevent PyTorch nn.Module submodule registration."""
-        return self.__dict__.get("_net_ema_module", None)
+        """Return registered net_ema submodule."""
+        return self._modules.get("net_ema", None)
 
     @net_ema.setter
     def net_ema(self, value: Optional[MinimalV1LVGDiT]) -> None:
-        """Set hidden _net_ema_module attribute directly in __dict__."""
+        """Set net_ema as a registered submodule."""
         if value is None:
-            self.__dict__.pop("_net_ema_module", None)
+            self._modules.pop("net_ema", None)
         else:
-            self.__dict__["_net_ema_module"] = value
+            self.add_module("net_ema", value)
 
     def _setup_rectified_flow(self):
         """Initialize flow scheduler and sampler."""
@@ -308,7 +308,7 @@ class CosmosXRay360(LightningModule):
             net_ema_module = self._create_dit(device="meta")
 
             local_rank = get_local_rank()
-            target_device = "cpu" if self.hparams.ema_offload_cpu else (f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+            target_device = "cpu" if (self.hparams.ema_offload_cpu and self.hparams.distributed_strategy != "fsdp") else (f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
             net_ema_module.to_empty(device=target_device)
             net_ema_module.init_weights()
             fix_rope_buffers(net_ema_module)
@@ -334,13 +334,14 @@ class CosmosXRay360(LightningModule):
                 ):
                     p_ema.data.copy_(p_net.data.to(target_device))
 
-            # Store directly in __dict__ and remove from _modules so PyTorch/FSDP does NOT register it as a submodule
-            self.__dict__["_net_ema_module"] = net_ema_module
-            self._modules.pop("_net_ema_module", None)
+            self.net_ema = net_ema_module
 
+            if self.hparams.distributed_strategy == "fsdp" and get_local_rank() == 0:
+                logger.info(
+                    f"[Cosmos25] net_ema is registered as an FSDP-sharded submodule on GPU cuda:{local_rank}"
+                )
         else:
-            self.__dict__["_net_ema_module"] = None
-            self._modules.pop("_net_ema_module", None)
+            self.net_ema = None
             self.ema_updater = None
             self.ema_exp_coefficient = None
 
@@ -593,7 +594,11 @@ class CosmosXRay360(LightningModule):
         Predict velocity using FRAME_REPLACE conditioning.
         Replaces conditioning frames in input and GT velocity in output.
         """
-        model_dtype = next(self.net.parameters()).dtype
+        model_dtype = (
+            torch.bfloat16
+            if "bf16" in str(getattr(self.hparams, "precision", "bf16-mixed"))
+            else torch.float32
+        )
         B, C, T, H, W = xt_B_C_T_H_W.shape
         condition_video_mask = None
 
@@ -683,19 +688,6 @@ class CosmosXRay360(LightningModule):
         
         return False
 
-    def _update_ema_fsdp(self, ema_beta: float) -> None:
-        """In-place FSDP shard-wise EMA update on CPU without GPU memory or all-gather overhead."""
-        for p_ema, p_net in zip(self.net_ema.parameters(), self.net.parameters()):
-            p_net_local = p_net.data.detach()
-            # If p_ema shape doesn't match p_net local shard shape, re-allocate shard on CPU
-            if p_ema.data.shape != p_net_local.shape:
-                p_ema.data = p_net_local.cpu().float()
-            else:
-                if p_ema.device != torch.device("cpu"):
-                    p_ema.data = p_ema.data.cpu()
-                p_net_cpu = p_net_local.cpu().to(dtype=p_ema.dtype)
-                p_ema.data.mul_(ema_beta).add_(p_net_cpu, alpha=1.0 - ema_beta)
-
     def on_before_zero_grad(self, optimizer):
         """Update and sync EMA model."""
         if self.hparams.enable_ema and self.net_ema is not None:
@@ -703,7 +695,8 @@ class CosmosXRay360(LightningModule):
 
             with torch.no_grad():
                 if self._is_fsdp():
-                    self._update_ema_fsdp(ema_beta)
+                    # FSDP-sharded net_ema: pure local elementwise update (zero communication)
+                    self.ema_updater.update_average(self.net, self.net_ema, beta=ema_beta)
                 else:
                     if self.hparams.ema_offload_cpu:
                         self.net_ema.to(self.device)
@@ -741,7 +734,7 @@ class CosmosXRay360(LightningModule):
                 original_net = self.net
                 original_dtype = next(self.net.parameters()).dtype
 
-                if self.hparams.ema_offload_cpu:
+                if not self._is_fsdp() and self.hparams.ema_offload_cpu:
                     self.net_ema.to(self.device)
 
                 self.net_ema.to(dtype=original_dtype)
@@ -752,7 +745,7 @@ class CosmosXRay360(LightningModule):
                     self.net = original_net
                     self.net_ema.to(dtype=torch.float32)
 
-                    if self.hparams.ema_offload_cpu:
+                    if not self._is_fsdp() and self.hparams.ema_offload_cpu:
                         self.net_ema.to("cpu")
             else:
                 yield
@@ -770,7 +763,8 @@ class CosmosXRay360(LightningModule):
 
         if use_ema:
             original_net = self.net
-            if self.hparams.ema_offload_cpu:
+
+            if not self._is_fsdp() and self.hparams.ema_offload_cpu:
                 self.net_ema.to(self.device)
 
             self.net_ema.to(dtype=torch.bfloat16)
@@ -780,7 +774,8 @@ class CosmosXRay360(LightningModule):
             finally:
                 self.net = original_net
                 self.net_ema.to(dtype=torch.float32)
-                if self.hparams.ema_offload_cpu:
+
+                if not self._is_fsdp() and self.hparams.ema_offload_cpu:
                     self.net_ema.to("cpu")
         else:
             original_dtype = next(self.net.parameters()).dtype
@@ -829,16 +824,48 @@ class CosmosXRay360(LightningModule):
     def on_save_checkpoint(self, checkpoint: dict) -> None:
         """Save EMA weights (Lightning doesn't save them by default)."""
         if self.hparams.enable_ema and self.net_ema is not None:
-            # Save EMA state dict as nested dict (cleaner than flattened keys)
-            checkpoint["net_ema"] = self.net_ema.state_dict()
+            if self._is_fsdp():
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 
-            # Save EMA metadata for bit-exact continuation
-            checkpoint["ema_exp_coefficient"] = self.ema_exp_coefficient
+                save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                fsdp_modules = [m for m in self.net_ema.modules() if isinstance(m, FSDP)]
+                if fsdp_modules:
+                    with contextlib.ExitStack() as stack:
+                        for mod in fsdp_modules:
+                            stack.enter_context(FSDP.state_dict_type(mod, StateDictType.FULL_STATE_DICT, save_policy))
+                        raw_ema_sd = self.net_ema.state_dict()
+                else:
+                    raw_ema_sd = self.net_ema.state_dict()
+            else:
+                raw_ema_sd = self.net_ema.state_dict()
 
             if get_local_rank() == 0:
+                clean_ema_sd = {
+                    k.removeprefix("_forward_module.").removeprefix("_orig_mod.").removeprefix("net_ema.").removeprefix("net."): v
+                    for k, v in raw_ema_sd.items()
+                }
+                checkpoint["net_ema"] = clean_ema_sd
+                checkpoint["ema_exp_coefficient"] = self.ema_exp_coefficient
                 logger.info(
                     f"[Cosmos25] Saved EMA weights ({len(checkpoint['net_ema'])} keys)"
                 )
+
+    def _load_ema_state_dict(self, state_dict: dict) -> None:
+        """Load state dict into net_ema, handling FSDP sharding if active."""
+        if self._is_fsdp():
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+
+            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+            fsdp_modules = [m for m in self.net_ema.modules() if isinstance(m, FSDP)]
+            if fsdp_modules:
+                with contextlib.ExitStack() as stack:
+                    for mod in fsdp_modules:
+                        stack.enter_context(FSDP.state_dict_type(mod, StateDictType.FULL_STATE_DICT, save_policy))
+                    self.net_ema.load_state_dict(state_dict, strict=False)
+                return
+        self.net_ema.load_state_dict(state_dict, strict=False)
 
     def on_load_checkpoint(self, checkpoint: dict) -> None:
         """Load EMA weights from checkpoint (backward compatible)."""
@@ -851,7 +878,7 @@ class CosmosXRay360(LightningModule):
                     )
 
                 try:
-                    self.net_ema.load_state_dict(checkpoint["net_ema"], strict=False)
+                    self._load_ema_state_dict(checkpoint["net_ema"])
 
                     # Restore EMA metadata if available
                     if "ema_exp_coefficient" in checkpoint:
@@ -874,7 +901,7 @@ class CosmosXRay360(LightningModule):
                         for k, v in checkpoint.items()
                         if k.startswith("net_ema.")
                     }
-                    self.net_ema.load_state_dict(ema_state_dict, strict=False)
+                    self._load_ema_state_dict(ema_state_dict)
 
                     if get_local_rank() == 0:
                         logger.info("[Cosmos25] ✓ Loaded EMA model (legacy format)")

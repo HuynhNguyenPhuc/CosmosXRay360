@@ -556,13 +556,38 @@ class GradClipCallback(Callback):
                 if param.grad is not None:
                     torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0, out=param.grad)
         
-        # Clip gradients
-        total_norm = clip_grad_norm_(
-            pl_module.net.parameters(),
-            max_norm=self.clip_norm,
-            norm_type=2.0,
-            error_if_nonfinite=False,
-        )
+        # Clip gradients (FSDP-aware)
+        is_fsdp = hasattr(pl_module, "_is_fsdp") and pl_module._is_fsdp()
+        if is_fsdp:
+            strategy_model = getattr(trainer.strategy, "model", None) if hasattr(trainer, "strategy") else None
+            if strategy_model is not None and hasattr(strategy_model, "clip_grad_norm_"):
+                total_norm = strategy_model.clip_grad_norm_(self.clip_norm, norm_type=2.0)
+            elif hasattr(pl_module, "clip_grad_norm_"):
+                total_norm = pl_module.clip_grad_norm_(self.clip_norm, norm_type=2.0)
+            elif hasattr(pl_module.net, "clip_grad_norm_"):
+                try:
+                    total_norm = pl_module.net.clip_grad_norm_(self.clip_norm, norm_type=2.0)
+                except RuntimeError:
+                    total_norm = clip_grad_norm_(
+                        pl_module.net.parameters(),
+                        max_norm=self.clip_norm,
+                        norm_type=2.0,
+                        error_if_nonfinite=False,
+                    )
+            else:
+                total_norm = clip_grad_norm_(
+                    pl_module.net.parameters(),
+                    max_norm=self.clip_norm,
+                    norm_type=2.0,
+                    error_if_nonfinite=False,
+                )
+        else:
+            total_norm = clip_grad_norm_(
+                pl_module.net.parameters(),
+                max_norm=self.clip_norm,
+                norm_type=2.0,
+                error_if_nonfinite=False,
+            )
         
         # Log periodically
         if trainer.global_step % self.log_every_n_steps == 0:

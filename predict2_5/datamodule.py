@@ -383,10 +383,20 @@ class PreRenderedDataModule(LightningDataModule):
         seed_everything(self.hparams.seed)
 
         if stage in (None, "fit"):
-            if self.train_dir.exists():
+            train_search_dir = self.train_dir
+            if self.hparams.use_latent_cache and self.latent_cache_dir:
+                candidate_dir = (
+                    self.latent_cache_dir / "train"
+                    if (self.latent_cache_dir / "train").exists()
+                    else self.latent_cache_dir
+                )
+                if candidate_dir.exists() and any(candidate_dir.iterdir()):
+                    train_search_dir = candidate_dir
+
+            if train_search_dir.exists():
                 all_patients = sorted([
                     p.name
-                    for p in self.train_dir.iterdir()
+                    for p in train_search_dir.iterdir()
                     if p.is_dir() and (
                         (p / "views").exists() or (p / "views.pt").exists() or (p / "views.npy").exists() or (p / "latent.pt").exists()
                     )

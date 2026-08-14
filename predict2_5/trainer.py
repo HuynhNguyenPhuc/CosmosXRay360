@@ -88,7 +88,7 @@ class TrainingConfig:
     pin_memory: bool = True
     persistent_workers: bool = True
     strategy: str = "auto"
-    ema_sync_every_n_steps: int = 100
+    ema_sync_every_n_steps: int = 10
 
     # Data
     dataset_path: str = "datasets/pre_rendered"
@@ -234,9 +234,10 @@ def get_strategy(config: TrainingConfig):
             broadcast_buffers=False,
         )
     elif strategy_name == "fsdp":
+        from cosmos_predict2._src.predict2.networks.minimal_v1_lvg_dit import MinimalV1LVGDiT
         from cosmos_predict2._src.predict2.networks.minimal_v4_dit import Block
         return FSDPStrategy(
-            auto_wrap_policy={Block},
+            auto_wrap_policy={MinimalV1LVGDiT, Block},
             use_orig_params=True,
             cpu_offload=False,
             activation_checkpointing_policy=None,
@@ -454,8 +455,14 @@ def parse_args():
     parser.add_argument(
         "--ema_sync_every_n_steps",
         type=int,
+        default=10,
+        help="[DEPRECATED — no-op now that net_ema is FSDP-sharded; kept for CLI backward-compat with existing launch scripts]",
+    )
+    parser.add_argument(
+        "--log_every_n_steps",
+        type=int,
         default=100,
-        help="How often to synchronize EMA parameters across devices (default 100 steps for post-training)",
+        help="Logging frequency in training steps for TensorBoard metrics",
     )
 
     # Data configuration
