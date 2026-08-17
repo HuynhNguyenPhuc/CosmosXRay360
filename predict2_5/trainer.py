@@ -6,6 +6,9 @@ warnings.filterwarnings("ignore")
 
 import os
 import sys
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import logging
 import argparse
 from datetime import datetime
@@ -54,6 +57,7 @@ class TrainingConfig:
     sac_mode: str = "predict2_2b_720_aggressive"
     checkpoint_path: str = None
     tokenizer_path: str = None
+    text_encoder_path: str = None
 
     # Training
     learning_rate: float = 2 ** (-14.5)
@@ -153,6 +157,7 @@ def get_callbacks(config: TrainingConfig):
             monitor="val_loss",
             mode="min",
             save_top_k=1,
+            save_weights_only=True,
         ),
         # Learning Rate Monitor
         LearningRateMonitor(logging_interval="step"),
@@ -288,6 +293,7 @@ def get_model(config: TrainingConfig) -> CosmosXRay360:
     return CosmosXRay360(
         checkpoint_path=config.checkpoint_path,
         tokenizer_path=config.tokenizer_path,
+        text_encoder_path=config.text_encoder_path,
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
         warmup_steps=config.warmup_steps,
@@ -398,6 +404,7 @@ def parse_args():
     )
     parser.add_argument("--checkpoint_path", type=str, default=None)
     parser.add_argument("--tokenizer_path", type=str, default=None)
+    parser.add_argument("--text_encoder_path", type=str, default=None)
 
     # Training hyperparameters
     parser.add_argument("--learning_rate", type=float, default=2 ** (-14.5))
@@ -438,7 +445,7 @@ def parse_args():
     parser.add_argument("--precision", type=str, default="bf16-mixed")
     parser.add_argument("--num_gpus", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--accumulate_grad_batches", type=int, default=1)
+    parser.add_argument("--accumulate_grad_batches", "--accum_steps", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--prefetch_factor", type=int, default=2)
     parser.add_argument("--pin_memory", action="store_true", default=True, help="Pin memory in DataLoader")

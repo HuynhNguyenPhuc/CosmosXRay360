@@ -84,6 +84,7 @@ class CosmosXRay360(LightningModule):
         tokenizer_path: Optional[str] = None,
         tokenizer_chunk_duration: int = 93,
         tokenizer_temporal_window: int = 16,
+        text_encoder_path: Optional[str] = None,
         learning_rate: float = 2 ** (-14.5),
         weight_decay: float = 0.001,
         warmup_steps: int = 2000,
@@ -129,6 +130,7 @@ class CosmosXRay360(LightningModule):
         self._setup_ema()
 
         self.prompt_encoder = CR1TextEncoder(
+            text_encoder_ckpt_path=text_encoder_path,
             device=device_str,
             cpu_offload=True,
         )
@@ -594,11 +596,6 @@ class CosmosXRay360(LightningModule):
         Predict velocity using FRAME_REPLACE conditioning.
         Replaces conditioning frames in input and GT velocity in output.
         """
-        model_dtype = (
-            torch.bfloat16
-            if "bf16" in str(getattr(self.hparams, "precision", "bf16-mixed"))
-            else torch.float32
-        )
         B, C, T, H, W = xt_B_C_T_H_W.shape
         condition_video_mask = None
 
@@ -640,14 +637,15 @@ class CosmosXRay360(LightningModule):
                 timesteps_B_T = timesteps_B_T.view(B, T)
 
         target_device = next(self.net.parameters()).device
+        target_dtype = next(self.net.parameters()).dtype
         cond_dict = condition.to_dict()
         for k, v in cond_dict.items():
             if isinstance(v, torch.Tensor):
                 cond_dict[k] = v.to(device=target_device)
 
         net_output_B_C_T_H_W = self.net(
-            x_B_C_T_H_W=xt_B_C_T_H_W.to(device=target_device, dtype=model_dtype),
-            timesteps_B_T=timesteps_B_T.to(device=target_device, dtype=model_dtype),
+            x_B_C_T_H_W=xt_B_C_T_H_W.to(device=target_device, dtype=target_dtype),
+            timesteps_B_T=timesteps_B_T.to(device=target_device, dtype=target_dtype),
             **cond_dict,
         ).float()
 
@@ -794,7 +792,7 @@ class CosmosXRay360(LightningModule):
             optim_type="fusedadam",
             betas=(0.9, 0.99),
             eps=1e-8,
-            master_weights=True,
+            master_weights=False,
             capturable=True,
         )
 
