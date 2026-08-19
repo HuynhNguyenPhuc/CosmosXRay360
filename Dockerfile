@@ -1,55 +1,113 @@
-# =====================================================================
-# CosmosXRay360 Cosmos-Predict2.5 Training & Evaluation Container
-# =====================================================================
-FROM nvidia/cuda:13.0.3-devel-ubuntu22.04
+# ==============================================================================
+# CosmosXRay360 Multi-Stage Dockerfile
+# ==============================================================================
+# This Dockerfile provides isolated environments for two independent pipelines:
+#
+#   1. predict3   : Cosmos 3 (cosmos-framework) training & inference.
+#   2. predict2_5 : Cosmos Predict 2.5 training & inference (DEFAULT target).
+#
+# Usage Examples:
+#   # Build default target (predict2_5):
+#   docker build -t cosmos_predict2_5 .
+#
+#   # Build Cosmos 3 target explicitly:
+#   docker build -t cosmos_predict3 --target predict3 .
+# ==============================================================================
 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies
+# ==============================================================================
+# STAGE 1: predict3 (Cosmos 3 / cosmos-framework)
+# ==============================================================================
+FROM nvidia/cuda:13.0.3-devel-ubuntu22.04 AS predict3
+
+# Environment Configuration
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PATH="/root/.local/bin:${PATH}" \
+    PYTHONPATH="/workspace/CosmosXRay360:/workspace/CosmosXRay360/cosmos-framework" \
+    LD_LIBRARY_PATH=""
+
+# 1. Install System Dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-dev \
-    python3-pip \
-    python3-venv \
+    ca-certificates \
+    curl \
+    ffmpeg \
     git \
     git-lfs \
-    build-essential \
-    cmake \
-    ninja-build \
-    curl \
-    ca-certificates \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
+    libx11-dev \
+    tree \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv for fast Python packaging
+# 2. Install Astral uv Package Manager
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:${PATH}"
 
 WORKDIR /workspace/CosmosXRay360
 
-# Copy requirements and install
+# 3. Copy & Sync cosmos-framework Submodule Dependencies (Cached Layer)
+COPY cosmos-framework/ cosmos-framework/
+RUN cd cosmos-framework && uv sync --all-extras --group=cu130-train
+
+# 4. Copy Application Code & Scripts
+COPY predict3/ predict3/
+COPY scripts/ scripts/
+
+CMD ["bash"]
+
+
+# ==============================================================================
+# STAGE 2: predict2_5 (Cosmos Predict 2.5 - Default Target)
+# ==============================================================================
+# Kept as the last stage so `docker build .` without --target defaults here.
+FROM nvidia/cuda:13.0.3-devel-ubuntu22.04 AS predict2_5
+
+# Environment Configuration
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PATH="/root/.local/bin:${PATH}" \
+    PYTHONPATH="/workspace/CosmosXRay360"
+
+# 1. Install System Dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    cmake \
+    curl \
+    git \
+    git-lfs \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    ninja-build \
+    python3-dev \
+    python3-pip \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Install Astral uv Package Manager
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+WORKDIR /workspace/CosmosXRay360
+
+# 3. Install Python Base Requirements
 COPY requirements.txt .
 RUN uv pip install --system -r requirements.txt
 
-# Install extra dependencies required by predict2_5 & baselines
+# 4. Install Additional Model & Baseline Dependencies
 RUN uv pip install --system \
-    pyhocon \
-    diffdrr \
-    torchio \
     accelerate \
-    scikit-image \
-    jaxtyping \
+    diffdrr \
     dotmap \
+    editables \
     hatchling \
-    editables
+    jaxtyping \
+    pyhocon \
+    scikit-image \
+    torchio
 
-# Copy full repository
+# 5. Copy Full Repository Code
 COPY . .
 
-# Install cosmos-predict2.5 submodule in editable mode
+# 6. Install cosmos-predict2.5 Submodule (Editable Mode)
 RUN cd cosmos-predict2.5 && uv pip install --system -e ".[cu128]" && cd ..
-
-ENV PYTHONPATH=/workspace/CosmosXRay360
 
 CMD ["bash"]

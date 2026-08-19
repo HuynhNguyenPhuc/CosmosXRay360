@@ -23,6 +23,15 @@ CosmosXRay360/             # Repository Root
 ├── cosmos-predict2.5/    # Submodule (NVIDIA's World Foundation Model Backbone)
 │   ├── tests/            # Test suite for DiT/VAE architectures
 │   └── setup.py          # Submodule configuration and dependencies
+├── predict3/             # Cosmos 3 Post-Training & Inference Package (docs/cosmos-predict3/PLAN.md)
+│   ├── constants.py      # NUM_FRAMES=93, Wan2.2 VAE geometry, real nvidia/Cosmos3-* HF repo ids
+│   ├── inferencer.py     # InferencerV3: thin wrapper around diffusers.Cosmos3OmniPipeline
+│   ├── losses.py         # Backbone-agnostic angular-offset + Beer-Lambert attenuation losses
+│   ├── recipes/          # cosmos-framework SFT recipe(s): xray360_edge.toml
+│   └── tests/            # CPU-only unit tests (losses, dataset builder, inferencer helpers)
+├── cosmos-framework/     # Submodule (NVIDIA's Cosmos 3 training/inference framework)
+│   ├── examples/         # Stock SFT recipes & launch shells (vision_sft_edge.toml, etc.)
+│   └── docs/             # Upstream setup/training/inference docs (has its own .claude/skills)
 ├── baselines/            # Baseline Evaluation & Training Harness
 │   ├── evaluate.py       # Unified multi-model OOD evaluation harness (UnifiedBaselineEvaluator)
 │   ├── run_all_training.sh # Unified training automation script
@@ -61,12 +70,16 @@ CosmosXRay360/             # Repository Root
 │   ├── PROPOSAL.md       # SOTA baselines & re-submission roadmap
 │   ├── baselines/        # Per-baseline PAPER.md, CODE.md, and LOG.md documentation
 │   ├── cosmos-predict2.5/ # Cosmos-Predict2.5 main method PAPER.md, CODE.md, and LOG.md
+│   ├── cosmos-predict3/  # Cosmos 3 backbone migration PLAN.md, README.md, PAPER.md, CODE.md, LOG.md
 │   └── reviews/          # Reviewer responses & analyses
 ├── renderers/            # Shared Physical Rendering Engines
 │   └── diffdrr/          # DiffDRR Siddon-Jacob ray-tracing standard
 ├── scripts/              # Command-Line Utilities & GCP Cloud Automation
 │   ├── fast_download.py  # Fast concurrent Hugging Face dataset downloader
 │   ├── pre_encode_latents.py # Offline batch VAE latent pre-encoding utility script
+│   ├── build_cosmos3_sft_dataset.py # DRR views -> Cosmos 3 SFT video+caption dataset (docs/cosmos-predict3/PLAN.md P2)
+│   ├── setup_predict3_env.sh # cosmos-framework/'s own venv setup (separate from the main .venv)
+│   ├── launch_cosmos3_worker.sh # Cosmos3-Edge SFT torchrun launch on an already-provisioned worker
 │   ├── upload_to_hf.py   # Upload checkpoints/models to Hugging Face Hub
 │   ├── launch_parallel_vms.sh # Launch GCP L4 VM instances for baseline training
 │   └── download_folder_from_gcs.py # Sync checkpoints from GCS buckets

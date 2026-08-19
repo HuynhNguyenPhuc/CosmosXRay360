@@ -10,6 +10,7 @@ Welcome to the **CosmosXRay360** developer documentation. This documentation is 
 |:---|:---|
 | *"How is the codebase structured and where is each file?"* | [`STRUCTURE.md`](STRUCTURE.md) |
 | *"What is our main method (Cosmos-Predict2.5) architecture and implementation?"* | [`cosmos-predict2.5/PAPER.md`](cosmos-predict2.5/PAPER.md) |
+| *"What is the Cosmos 3 backbone migration (predict3/) and its status?"* | [`cosmos-predict3/PLAN.md`](cosmos-predict3/PLAN.md), [`cosmos-predict3/PAPER.md`](cosmos-predict3/PAPER.md) |
 | *"What happens chronologically when a single batch runs?"* | [`WALKTHROUGH.md`](WALKTHROUGH.md) |
 | *"Why is my training/inference silently doing the wrong thing?"* | [`GOTCHAS.md`](GOTCHAS.md) |
 | *"How do I train and evaluate all baseline models?"* | [`EXECUTION.md`](EXECUTION.md) |

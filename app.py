@@ -27,9 +27,10 @@ from predict2_5.utils import get_logger
 
 
 MODEL_CACHE = {
-    "model": None, 
-    "device": None, 
-    "checkpoint_path": None
+    "model": None,
+    "device": None,
+    "checkpoint_path": None,
+    "backbone": None
 }
 
 # --- Logger --- #
@@ -112,41 +113,55 @@ def apply_display_postprocess(
 
 
 def get_or_load_model(
-    checkpoint_path: str, 
-    config_path: str, 
-    device: str
+    checkpoint_path: str,
+    config_path: str,
+    device: str,
+    backbone: str = "predict2_5",
 ):
     """
     Get or load the Inferencer model, with caching to avoid redundant loads.
 
     Args:
-        checkpoint_path: Path to the model checkpoint.
-        config_path: Path to the model config file.
-        device: Device to load the model on ("cuda" or "cpu").
+        checkpoint_path: Path to the model checkpoint (predict2_5: local
+            path, hf:// URI, or Cosmos UUID; predict3: local diffusers
+            export dir or a bare HF repo id like "nvidia/Cosmos3-Edge").
+        config_path: Path to the model config file. Unused for predict3
+            (Cosmos3OmniPipeline.from_pretrained reads its own config).
+        device: Device to load the model on ("cuda" or "cpu"). predict3
+            requires "cuda" (BF16-only, Ampere+; see
+            docs/cosmos-predict3/PLAN.md Sec. 2).
+        backbone: "predict2_5" or "predict3".
 
     Returns:
-        Loaded Inferencer model.
+        Loaded Inferencer / InferencerV3 model.
     """
-    # If the model is already loaded with the same checkpoint and device, return it from cache
+    # If the model is already loaded with the same checkpoint/device/backbone, return it from cache
     if (
         MODEL_CACHE["model"] is not None
         and MODEL_CACHE["checkpoint_path"] == checkpoint_path
         and MODEL_CACHE["device"] == device
+        and MODEL_CACHE["backbone"] == backbone
     ):
         return MODEL_CACHE["model"]
 
     # If not cached, load the model and store it in the cache
-    from predict2_5.inferencer import Inferencer
+    if backbone == "predict3":
+        from predict3.inferencer import InferencerV3
 
-    model = Inferencer(
-        checkpoint_path=checkpoint_path,
-        config_path=config_path,
-        device=device,
-    )
+        model = InferencerV3(checkpoint_path=checkpoint_path, device=device)
+    else:
+        from predict2_5.inferencer import Inferencer
+
+        model = Inferencer(
+            checkpoint_path=checkpoint_path,
+            config_path=config_path,
+            device=device,
+        )
 
     MODEL_CACHE["model"] = model
     MODEL_CACHE["checkpoint_path"] = checkpoint_path
     MODEL_CACHE["device"] = device
+    MODEL_CACHE["backbone"] = backbone
 
     return model
 
@@ -225,36 +240,50 @@ def generate_video(
     num_steps: int,
     checkpoint_path: str,
     config_path: str,
+    backbone: str = "predict2_5",
 ) -> tuple[str, list[np.ndarray]]:
     """
     Generate video from an uploaded X-Ray image.
-    
+
     Args:
         xray_image: Uploaded X-Ray image as a numpy array (H, W, C).
         cfg_scale: Classifier-free guidance scale.
         num_steps: Number of diffusion steps.
         checkpoint_path: Path to model checkpoint.
         config_path: Path to model config.
-    
+        backbone: "predict2_5" or "predict3". The two Inferencer classes use
+            different keyword names for the same two knobs (predict2_5:
+            cfg_scale/num_steps; predict3/diffusers convention:
+            guidance_scale/num_inference_steps) -- both return the same
+            list[np.ndarray] contract (docs/cosmos-predict3/PLAN.md P3), so
+            only the call below needs to branch.
+
     Returns:
         Tuple of (status_message, list_of_frames).
     """
     if xray_image is None:
         return "Please upload an X-Ray image.", []
-    
+
     try:
         # Get the current device
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # Get or load the model (with caching)
-        model = get_or_load_model(checkpoint_path, config_path, device)
+        model = get_or_load_model(checkpoint_path, config_path, device, backbone=backbone)
 
         # Run inference to get the video
-        frames = model.predict(
-            image=xray_image,
-            cfg_scale=float(np.clip(cfg_scale, 0.0, 6.0)),
-            num_steps=int(np.clip(num_steps, 5, 80)),
-        )
+        if backbone == "predict3":
+            frames = model.predict(
+                image=xray_image,
+                guidance_scale=float(np.clip(cfg_scale, 0.0, 6.0)),
+                num_inference_steps=int(np.clip(num_steps, 5, 80)),
+            )
+        else:
+            frames = model.predict(
+                image=xray_image,
+                cfg_scale=float(np.clip(cfg_scale, 0.0, 6.0)),
+                num_steps=int(np.clip(num_steps, 5, 80)),
+            )
 
         return f"✓ Generated {len(frames)} views.", frames
     except Exception as e:
@@ -262,27 +291,29 @@ def generate_video(
         return f"❌ Model inference failed: {e}", []
 
 
-def build_app(checkpoint_path: str, config_path: str) -> gr.Blocks:
+def build_app(checkpoint_path: str, config_path: str, backbone: str = "predict2_5") -> gr.Blocks:
     """
     Build the Gradio app interface.
 
     Args:
         checkpoint_path: Path to model checkpoint.
         config_path: Path to model config.
+        backbone: "predict2_5" or "predict3" (docs/cosmos-predict3/PLAN.md P6).
 
     Returns:
         Gradio Blocks object representing the app.
     """
     # Get the current device
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    title = "Cosmos Predict 2.5" if backbone == "predict2_5" else "Cosmos 3"
 
-    with gr.Blocks(title="Cosmos Predict 2.5 X-Ray Video Generation") as demo:
-        gr.Markdown("## Cosmos Predict 2.5 X-Ray Video Generation")
+    with gr.Blocks(title=f"{title} X-Ray Video Generation") as demo:
+        gr.Markdown(f"## {title} X-Ray Video Generation")
 
         # Load model at startup and show status
         try:
-            get_or_load_model(checkpoint_path, config_path, device)
-            gr.Markdown(f"✓ Model loaded on **{device.upper()}**")
+            get_or_load_model(checkpoint_path, config_path, device, backbone=backbone)
+            gr.Markdown(f"✓ Model loaded on **{device.upper()}** (backbone: `{backbone}`)")
         except Exception as e:
             gr.Markdown(f"⚠ Failed to load model: {e}")
             return demo
@@ -351,6 +382,7 @@ def build_app(checkpoint_path: str, config_path: str) -> gr.Blocks:
         stretch_range_state = gr.State(None)
         ckpt_state = gr.State(checkpoint_path)
         config_state = gr.State(config_path)
+        backbone_state = gr.State(backbone)
 
         # Define event handler for video generation
         def on_generate(
@@ -360,14 +392,16 @@ def build_app(checkpoint_path: str, config_path: str) -> gr.Blocks:
             display_mode,
             checkpoint_path,
             config_path,
+            backbone,
         ):
             """Generate video and prepare outputs."""
             status_msg, frames = generate_video(
                 xray_image=xray_image,
                 cfg_scale=cfg_scale,
-                num_steps=num_steps, 
-                checkpoint_path=checkpoint_path, 
-                config_path=config_path
+                num_steps=num_steps,
+                checkpoint_path=checkpoint_path,
+                config_path=config_path,
+                backbone=backbone,
             )
 
             stretch_range = compute_stretch_range(frames)
@@ -441,6 +475,7 @@ def build_app(checkpoint_path: str, config_path: str) -> gr.Blocks:
                 display_mode,
                 ckpt_state,
                 config_state,
+                backbone_state,
             ],
             outputs=[
                 status,
@@ -468,19 +503,30 @@ def build_app(checkpoint_path: str, config_path: str) -> gr.Blocks:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Cosmos Predict 2.5 X-Ray Demo")
-    
+    parser = argparse.ArgumentParser(description="Cosmos X-Ray Demo")
+
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        choices=["predict2_5", "predict3"],
+        default="predict2_5",
+        help="Which post-trained backbone to serve (docs/cosmos-predict3/PLAN.md P6). "
+        "predict3 requires an Ampere+ CUDA GPU (BF16-only).",
+    )
     parser.add_argument(
         "--checkpoint-path",
         type=str,
-        required=True,
-        help="Path to trained Lightning checkpoint",
+        default=None,
+        help="predict2_5: path to trained Lightning checkpoint (required). "
+        "predict3: local diffusers export dir or a bare HF repo id "
+        "(default: nvidia/Cosmos3-Edge, zero-shot).",
     )
     parser.add_argument(
         "--config-path",
         type=str,
         default=None,
-        help="Path to config.json. Defaults to same directory as checkpoint.",
+        help="predict2_5 only: path to config.json. Defaults to same directory as checkpoint. "
+        "Unused for predict3.",
     )
     parser.add_argument("--server-name", type=str, default="0.0.0.0")
     parser.add_argument("--server-port", type=int, default=7860)
@@ -492,7 +538,16 @@ if __name__ == "__main__":
     checkpoint_path = args.checkpoint_path
     cfg_path = args.config_path
 
-    if checkpoint_path.startswith("hf://"):
+    if args.backbone == "predict3":
+        # predict3 checkpoints are a whole diffusers-pipeline snapshot (local dir or
+        # bare HF repo id like "nvidia/Cosmos3-Edge") -- none of predict2_5's
+        # single-file hf://.../config.json sibling or Cosmos-UUID resolution applies
+        # (see predict3.inferencer.InferencerV3._resolve_checkpoint).
+        ckpt_str = checkpoint_path  # None is valid: InferencerV3 defaults to COSMOS3_EDGE_REPO
+        cfg_path = None
+    elif checkpoint_path is None:
+        parser.error("--checkpoint-path is required for --backbone predict2_5")
+    elif checkpoint_path.startswith("hf://"):
         # If config path not provided, assume it's in the same repository under "config.json"
         if cfg_path is None:
             if "@" in checkpoint_path:
@@ -500,7 +555,7 @@ if __name__ == "__main__":
                 suffix = f"@{revision_part}"
             else:
                 uri_part, suffix = checkpoint_path, ""
-            
+
             if "/" in uri_part:
                 prefix, _ = uri_part.rsplit("/", 1)
                 cfg_path = f"{prefix}/config.json{suffix}"
@@ -513,7 +568,7 @@ if __name__ == "__main__":
             from predict2_5.utils import is_uuid_format
             if not is_uuid_format(checkpoint_path):
                 raise FileNotFoundError(f"Checkpoint not found locally and is not a valid Hugging Face URI or Cosmos UUID: {checkpoint_path}")
-        
+
         if cfg_path is None:
             if ckpt.exists():
                 cfg_path = str(ckpt.parent / "config.json")
@@ -522,7 +577,7 @@ if __name__ == "__main__":
         ckpt_str = str(ckpt) if ckpt.exists() else checkpoint_path
 
     # Build the Gradio app
-    app = build_app(checkpoint_path=ckpt_str, config_path=cfg_path)
+    app = build_app(checkpoint_path=ckpt_str, config_path=cfg_path, backbone=args.backbone)
 
     # Launch the Gradio app
     app.launch(
