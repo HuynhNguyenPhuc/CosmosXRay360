@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
+import math
 import os
 import sys
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import torchvision.transforms.functional as TF
 from PIL import Image
@@ -21,6 +22,7 @@ svdrr_dir = os.path.join(BASE_DIR, "cloned", "SV-DRR")
 sys.path.insert(0, svdrr_dir)
 
 from pipeline_svdrr_DiT import CCProjection, SvdrrDiTPipeline  # type: ignore
+from diffusion.iddpm import IDDPM  # type: ignore
 
 from models.svdrr import SVDRRWrapper
 from models.utils import get_train_val_patient_dirs
@@ -38,6 +40,32 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # Helper Functions
 # =============================================================================
+
+def sample_timesteps_logit_normal(
+    batch_size: int,
+    device: torch.device,
+    num_timesteps: int = 1000,
+    mean: float = 0.0,
+    std: float = 1.0,
+) -> torch.Tensor:
+    """Samples diffusion timesteps from a logit-normal distribution (EDM-style).
+
+    Biases training toward mid-noise timesteps that determine structure.
+
+    Args:
+        batch_size: Number of timesteps to sample.
+        device: Device to sample on.
+        num_timesteps: Total diffusion timesteps in the schedule.
+        mean: Logit-normal distribution mean.
+        std: Logit-normal distribution standard deviation.
+
+    Returns:
+        LongTensor of shape [batch_size], values in [0, num_timesteps - 1].
+    """
+    u = torch.randn(batch_size, device=device)
+    t_normalized = torch.sigmoid(mean + std * u)
+    return (t_normalized * num_timesteps).clamp(0, num_timesteps - 1).long()
+
 
 def train_svdrr(args: argparse.Namespace) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -80,16 +108,42 @@ def train_svdrr(args: argparse.Namespace) -> None:
     cc_projection = pipe.cc_projection
     cc_projection.train()
 
+    # Reference DiT optimizer config: beta2=0.95 and zero weight decay.
     optimizer = optim.AdamW(
         [
             {"params": transformer.parameters(), "lr": args.lr},
             {"params": cc_projection.parameters(), "lr": 10.0 * args.lr},
         ],
-        betas=(0.9, 0.999),
-        weight_decay=1e-2,
+        betas=(0.9, 0.95),
+        weight_decay=0.0,
         eps=1e-8,
     )
-    criterion = nn.MSELoss()
+
+    # IDDPM training objective with learned variance and hybrid SNR parameterization.
+    diffusion = IDDPM(
+        timestep_respacing="",
+        noise_schedule="linear",
+        use_kl=False,
+        sigma_small=False,
+        predict_xstart=False,
+        learn_sigma=True,
+        pred_sigma=True,
+        rescale_learned_sigmas=False,
+        diffusion_steps=pipe.scheduler.config.num_train_timesteps,
+        snr=True,
+        return_startx=False,
+    )
+
+    # Maintain EMA shadow weights of the transformer for inference.
+    ema_transformer = copy.deepcopy(transformer)
+    for p in ema_transformer.parameters():
+        p.requires_grad_(False)
+    ema_transformer.eval()
+
+    @torch.no_grad()
+    def update_ema(decay: float) -> None:
+        for ema_p, p in zip(ema_transformer.parameters(), transformer.parameters()):
+            ema_p.mul_(decay).add_(p.detach(), alpha=1 - decay)
 
     # 3. Load & Filter Dataset Patients
     rendered_dir = os.path.join(BASE_DIR, "..", "datasets", "pre_rendered")
@@ -100,7 +154,14 @@ def train_svdrr(args: argparse.Namespace) -> None:
 
     logger.info(f"Found {len(train_patient_dirs)} train cases and {len(val_patient_dirs)} val cases for SV-DRR.")
 
-    viz_patient_dir = val_patient_dirs[0] if val_patient_dirs else None
+    if getattr(args, "viz_patient", None):
+        matching = [d for d in val_patient_dirs + train_patient_dirs if os.path.basename(d) == args.viz_patient or d.endswith(args.viz_patient)]
+        viz_patient_dir = matching[0] if matching else (val_patient_dirs[0] if val_patient_dirs else None)
+    else:
+        viz_patient_dir = val_patient_dirs[0] if val_patient_dirs else None
+
+    if viz_patient_dir:
+        logger.info(f"Using '{os.path.basename(viz_patient_dir)}' for live multi-view visualization panels.")
 
     # 4. Cache VAE Latents & CLIP Embeddings
     CACHE_BATCH = 16
@@ -196,7 +257,20 @@ def train_svdrr(args: argparse.Namespace) -> None:
     logger.info(f"Starting SV-DRR fine-tuning for {args.epochs} epochs...")
 
     best_loss = float("inf")
-    patience_counter = 0
+
+    # LR schedule with linear warmup and cosine decay to 10% peak LR.
+    effective_batch = args.batch_size * args.accum_steps
+    steps_per_epoch = max(1, len(train_cached) // effective_batch)
+    max_train_steps = args.epochs * steps_per_epoch
+    min_lr_ratio = 0.1
+
+    def lr_lambda(step: int) -> float:
+        if step < args.warmup_steps:
+            return step / max(1, args.warmup_steps)
+        progress = min(1.0, (step - args.warmup_steps) / max(1, max_train_steps - args.warmup_steps))
+        return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # 7. Training Epoch Loop
     for epoch in range(1, args.epochs + 1):
@@ -207,9 +281,6 @@ def train_svdrr(args: argparse.Namespace) -> None:
 
         epoch_train_loss = torch.zeros((), device=device)
         num_train_steps = 0
-
-        effective_batch = args.batch_size * args.accum_steps
-        steps_per_epoch = max(1, len(train_cached) // effective_batch)
 
         for _ in range(steps_per_epoch):
             optimizer.zero_grad(set_to_none=True)
@@ -226,43 +297,49 @@ def train_svdrr(args: argparse.Namespace) -> None:
                 )
                 raw_cond = torch.cat([src_img_embeds.to(device), pose_prompt_embeds], dim=-1)
                 cc_emb = cc_projection(raw_cond)
+                cond_latents = src_latents
 
-                timesteps = torch.randint(
-                    0, pipe.scheduler.config.num_train_timesteps, (B,), device=device
-                ).long()
-                noise = torch.randn_like(tgt_latents)
-                noisy_latents = pipe.scheduler.add_noise(tgt_latents, noise, timesteps)
+                # CFG dropout: randomly drop conditioning for classifier-free guidance.
+                if args.conditioning_dropout_prob > 0:
+                    drop_mask = torch.rand(B, device=device) < args.conditioning_dropout_prob
+                    if drop_mask.any():
+                        cc_emb = cc_emb.clone()
+                        cond_latents = cond_latents.clone()
+                        cc_emb[drop_mask] = 0
+                        cond_latents[drop_mask] = 0
+
+                timesteps = sample_timesteps_logit_normal(
+                    B, device, pipe.scheduler.config.num_train_timesteps
+                )
 
                 added_cond_kwargs = {
                     "resolution": torch.tensor([[256, 256]], device=device).expand(B, -1),
                     "aspect_ratio": torch.tensor([[1.0]], device=device).expand(B, -1),
                 }
+                model_kwargs = {
+                    "encoder_hidden_states": cc_emb,
+                    "latents_concat": cond_latents,
+                    "added_cond_kwargs": added_cond_kwargs,
+                }
 
-                if transformer.config.in_channels == 8:
-                    hidden_states = torch.cat([noisy_latents, src_latents], dim=1)
-                else:
-                    hidden_states = noisy_latents
-
-                noise_pred = transformer(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=cc_emb,
-                    timestep=timesteps,
-                    added_cond_kwargs=added_cond_kwargs,
-                    return_dict=False,
-                )[0]
-
-                if getattr(pipe.scheduler.config, "prediction_type", "epsilon") == "v_prediction":
-                    target = pipe.scheduler.get_velocity(tgt_latents, noise, timesteps)
-                else:
-                    target = noise
-
-                loss = criterion(noise_pred[:, :4], target) / args.accum_steps
+                loss_dict = diffusion.training_losses_diffusers(
+                    transformer, x_start=tgt_latents, timestep=timesteps,
+                    model_kwargs=model_kwargs,
+                )
+                loss = loss_dict["loss"].mean() / args.accum_steps
                 loss.backward()
 
                 epoch_train_loss += (loss.detach() * args.accum_steps)
                 num_train_steps += 1
 
+            if args.gradient_clip_val > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    list(transformer.parameters()) + list(cc_projection.parameters()),
+                    max_norm=args.gradient_clip_val,
+                )
             optimizer.step()
+            lr_scheduler.step()
+            update_ema(args.ema_decay)
 
         avg_train_loss = (epoch_train_loss / max(1, num_train_steps)).item()
 
@@ -287,38 +364,28 @@ def train_svdrr(args: argparse.Namespace) -> None:
                 raw_cond = torch.cat([src_embed.to(device), pose_prompt_embeds], dim=-1)
                 cc_emb = cc_projection(raw_cond)
 
+                # Uniform timestep sampling for unbiased validation loss evaluation.
                 timesteps = torch.randint(
                     0, pipe.scheduler.config.num_train_timesteps, (1,),
                     generator=val_generator, device=device
                 ).long()
-
                 noise = torch.randn(tgt_latents.shape, generator=val_generator, device=device)
-                noisy_latents = pipe.scheduler.add_noise(tgt_latents, noise, timesteps)
 
                 added_cond_kwargs = {
                     "resolution": torch.tensor([[256, 256]], device=device),
                     "aspect_ratio": torch.tensor([[1.0]], device=device),
                 }
+                model_kwargs = {
+                    "encoder_hidden_states": cc_emb,
+                    "latents_concat": src_latents,
+                    "added_cond_kwargs": added_cond_kwargs,
+                }
 
-                if transformer.config.in_channels == 8:
-                    hidden_states = torch.cat([noisy_latents, src_latents], dim=1)
-                else:
-                    hidden_states = noisy_latents
-
-                noise_pred = transformer(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=cc_emb,
-                    timestep=timesteps,
-                    added_cond_kwargs=added_cond_kwargs,
-                    return_dict=False,
-                )[0]
-
-                if getattr(pipe.scheduler.config, "prediction_type", "epsilon") == "v_prediction":
-                    target = pipe.scheduler.get_velocity(tgt_latents, noise, timesteps)
-                else:
-                    target = noise
-
-                val_loss = criterion(noise_pred[:, :4], target)
+                loss_dict = diffusion.training_losses_diffusers(
+                    transformer, x_start=tgt_latents, timestep=timesteps,
+                    model_kwargs=model_kwargs, noise=noise,
+                )
+                val_loss = loss_dict["loss"].mean()
 
                 epoch_val_loss += val_loss.detach()
                 num_val_steps += 1
@@ -326,9 +393,11 @@ def train_svdrr(args: argparse.Namespace) -> None:
         avg_val_loss = (epoch_val_loss / max(1, num_val_steps)).item()
 
         # --- Logging & TensorBoard --- #
-        logger.info(f"Epoch [{epoch}/{args.epochs}] - Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+        current_lr = lr_scheduler.get_last_lr()[0]
+        logger.info(f"Epoch [{epoch}/{args.epochs}] - Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f} | LR: {current_lr:.2e}")
         writer.add_scalar("Loss/train", avg_train_loss, epoch)
         writer.add_scalar("Loss/val", avg_val_loss, epoch)
+        writer.add_scalar("LR/transformer", current_lr, epoch)
 
         if args.viz_every > 0 and (epoch % args.viz_every == 0 or epoch == args.epochs) and viz_patient_dir is not None:
             pa_path = os.path.join(viz_patient_dir, "pa.png")
@@ -341,6 +410,7 @@ def train_svdrr(args: argparse.Namespace) -> None:
                     torch.save({
                         "transformer": {k: v.detach().cpu() for k, v in transformer.state_dict().items()},
                         "cc_projection": {k: v.detach().cpu() for k, v in cc_projection.state_dict().items()},
+                        "ema_transformer": {k: v.detach().cpu() for k, v in ema_transformer.state_dict().items()},
                     }, path)
 
                 tmp_ckpt_path = os.path.join(ckpt_dir, f"_viz_tmp_svdrr_{os.getpid()}.pt")
@@ -356,25 +426,21 @@ def train_svdrr(args: argparse.Namespace) -> None:
                 transformer.train()
                 cc_projection.train()
 
-        # --- Checkpoint Saving & Early Stopping --- #
+        # --- Checkpoint Saving --- #
         if avg_val_loss < best_loss:
             best_loss = avg_val_loss
-            patience_counter = 0
 
             best_state_dict = {
                 "transformer": {k: v.cpu().clone() for k, v in transformer.state_dict().items()},
                 "cc_projection": {k: v.cpu().clone() for k, v in cc_projection.state_dict().items()},
+                "ema_transformer": {k: v.cpu().clone() for k, v in ema_transformer.state_dict().items()},
             }
             logger.info(f"New best model recorded (Val Loss: {best_loss:.6f})")
-        else:
-            patience_counter += 1
-            if args.patience > 0 and patience_counter >= args.patience:
-                logger.info(f"Early stopping triggered at epoch {epoch} (patience={args.patience}).")
-                break
 
     latest_state_dict = {
         "transformer": {k: v.cpu().clone() for k, v in transformer.state_dict().items()},
         "cc_projection": {k: v.cpu().clone() for k, v in cc_projection.state_dict().items()},
+        "ema_transformer": {k: v.cpu().clone() for k, v in ema_transformer.state_dict().items()},
     }
 
     if 'best_state_dict' in locals():
@@ -395,14 +461,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SV-DRR Baseline Trainer")
 
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
-    parser.add_argument("--patience", type=int, default=50, help="Early stopping patience (0 to disable)")
     parser.add_argument("--lr", type=float, default=5e-6, help="Learning rate")
     parser.add_argument("--max_val_samples", type=int, default=None, help="Max validation samples")
     parser.add_argument("--max_train_samples", type=int, default=None, help="Max training samples")
     parser.add_argument("--viz_every", type=int, default=10, help="Log multi-view TensorBoard panel every N epochs (0 to disable)")
     parser.add_argument("--viz_views", type=int, default=6, help="Number of azimuths per multi-view panel")
+    parser.add_argument("--viz_patient", type=str, default=None, help="Specific patient ID/directory name to use for multi-view visualization panel (e.g. mela_0001)")
     parser.add_argument("--batch_size", type=int, default=16, help="Micro-batch size per optimization step")
     parser.add_argument("--accum_steps", type=int, default=4, help="Gradient accumulation steps")
+    parser.add_argument("--conditioning_dropout_prob", type=float, default=0.05, help="Per-sample probability of dropping conditioning during training, for classifier-free guidance capability")
+    parser.add_argument("--ema_decay", type=float, default=0.9995, help="EMA decay rate for the transformer weights")
+    parser.add_argument("--warmup_steps", type=int, default=500, help="LR warmup steps before cosine decay begins")
+    parser.add_argument("--gradient_clip_val", type=float, default=0.5, help="Gradient clipping max norm (0 to disable)")
 
     args = parser.parse_args()
     train_svdrr(args)

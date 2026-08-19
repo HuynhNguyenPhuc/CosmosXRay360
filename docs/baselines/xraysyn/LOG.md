@@ -1,5 +1,94 @@
 # XRaySyn Change & Fix Log
 
+## 2026-08-15 — Compared Against Cosmos-NVSyn's Reference Implementation: No Real Training Gaps Found
+
+**Phase:** 2 (Correctness verification)
+**Files:** none changed -- comparison only
+**Change:** After finding real training-methodology gaps for SV-DRR against its
+`Cosmos-NVSyn/model/nvsyn_svdrr.py` sibling reference, did the same diff for XRaySyn against
+`Cosmos-NVSyn/model/nvsyn_xraysyn.py`. Unlike SV-DRR (a from-scratch training loop this project wrote),
+XRaySyn's training is almost entirely delegated to `baselines/cloned/XraySyn/xraysyn/models/
+ct2xray_real_gan_meta.py`'s own `XraySynModel.optimize()` -- the *original* paper repo's own training
+method, not something this project reimplemented -- so the comparison is really "does the vendored
+`optimize()` match the reference," not "does this project's code match it."
+**Result -- already matching, nothing to port**: `optimize()` already has: the same LSGAN discriminator
+loss (`GANLoss(gan_mode='lsgan')` == the reference's MSE-vs-ones/zeros formulation), the same loss
+weights (`0.02` GAN, `0.005` sparse, conditionally applied when `loss_sparse.item() > 1`, both matching
+the reference's `gan_weight=0.02, sparse_weight=0.005` exactly), the same `torch.nn.utils.
+clip_grad_norm_(..., max_norm=1.0)` gradient clipping on both the discriminator and generator (already
+added 2026-08-07, see below), the same `not torch.isnan(loss)` guard before each optimizer step, and
+the same Adam `beta1=0.5` (paired with the reference's `beta1=0.5, beta2=0.9`). Neither version trains
+directly against paired novel-view ground truth in the loss (the reference computes `novel_l1` only for
+logging when `image_target` happens to be available; this project's training loop never provides one
+either) -- consistent, not a gap.
+**One real, but already-deliberate, difference found**: the reference clamps `atten_proj` symmetrically
+to `[-10.0, 10.0]` before `exp()`; the vendored code clamps only the upper bound (`max=50.0`), per an
+existing in-code comment explaining this project's 360-degree training range produces larger `atten_proj`
+magnitudes than the original paper's +/-9-degree range, so a tighter +/-10 bound would clip too
+aggressively here. This is a reasoned, already-documented divergence (see the 2026-08-07 entry below),
+not an oversight -- flagging it as low-priority (a missing lower clamp risks `exp()` underflowing toward
+0 on very negative inputs, not the overflow/NaN risk the missing *upper* bound would have posed) rather
+than porting it.
+**Verification**: direct read of `ct2xray_real_gan_meta.py`'s `__init__`/`ct2xray`/`optimize()` against
+`nvsyn_xraysyn.py`'s `__init__`/`training_step`/`configure_optimizers`, line-by-line on the loss
+composition, optimizer config, and clipping/NaN-guard logic.
+
+---
+
+## 2026-08-14 — Reverted the Vertical-Flip "Fix" Below: It Was Actually Backwards
+
+**Phase:** 2 (Correctness verification — correcting a same-day entry)
+**Files:** `baselines/models/xraysyn.py`
+**Change:** Removed `proj = torch.flip(proj, dims=[-2])` from `infer_multi_views`, reverting to the
+unflipped output the entry directly below this one had just replaced.
+**Why:** The entry below claims this flip was empirically verified against a real checkpoint and GT.
+It wasn't verified correctly. User flagged that a freshly-regenerated `results/xraysyn.png` (with the
+flip active) still looked visually wrong, which prompted a re-check using a stronger ground truth
+anchor than `views/*.png`: the raw, wrapper-untouched `pa.png` input itself (azimuth ≈0° should
+closely match it, and zero wrapper logic sits between disk and that file, so it can't itself be
+mis-oriented by anything this wrapper does). Row-wise brightness-profile correlation against `pa.png`:
+**without** the flip, `corr(pa, pred) = 0.81` (strong match); **with** the flip (the staged/just-reverted
+state), `corr(pa, pred) = 0.02` (no match, effectively scrambled). Direct visual comparison confirms
+the same thing — without the flip, the near-0° prediction has clavicles/apex at the top and a bright
+diaphragm/abdomen band at the bottom, matching `pa.png`; with the flip, that's inverted. The entry
+below's own "without the flip it's upside down" claim does not hold up against this stronger anchor —
+most likely that verification pass compared against a mis-oriented reference or mislabeled which grid
+row was prediction vs. ground truth; the exact cause of the earlier mistake wasn't identified, only
+that the conclusion was wrong.
+**Verification:** Quantitative (row-profile correlation against the unambiguous raw input, not just a
+visual read of `views/*.png`) plus direct visual comparison. Full 8-view/3-patient panel regenerated via
+`scripts/regenerate_tb_images.py --baseline xraysyn --checkpoint baselines/checkpoints/xraysyn_best.pt`:
+near-frontal columns (~0-45°, ~315-360°) now closely match ground truth; oblique columns (~90-270°)
+remain blurry/hallucinated, the same genuinely-OOD-single-view failure mode already documented for
+Dx2CT (`docs/baselines/dx2ct/LOG.md`'s 2026-08-14 entry), not an orientation problem. `results/xraysyn.png`
+and `baselines/checkpoints/tensorboard_fixed/xraysyn/` updated with the corrected panel.
+**Lesson:** a LOG.md entry claiming something was "empirically verified" is not itself proof — this
+project's own read-first discipline applies to its own past entries too, not just to a paper/repo being
+read for the first time. Re-derive from the strongest available ground truth anchor when a result looks
+suspicious, rather than trusting a prior conclusion because it was labeled "verified."
+
+---
+
+## 2026-08-14 — Empirically Confirmed a Staged Vertical-Flip Fix Against a Real Trained Checkpoint
+**⚠️ Superseded by the correction entry directly above — this conclusion was wrong.**
+
+**Phase:** 2 (Correctness verification)
+**Files:** `baselines/models/xraysyn.py` (no further change — verifying an already-staged, uncommitted fix)
+**Change:** None to this file; confirmed the staged `proj = torch.flip(proj, dims=[-2])` line (added
+before `results.append(proj)` in `infer_multi_views`) is correct rather than assuming it from its comment.
+**Why verified, not just trusted:** Ran the wrapper against a real trained checkpoint
+(`baselines/checkpoints/xraysyn_best.pt`, completed locally today) and a freshly-DiffDRR-rendered real
+NSCLC test patient (`LUNG1-001_0000`, via `datasets/pre_render_diffdrr.py`), both with and without the
+flip (temporarily monkeypatching `torch.flip` to a no-op for the comparison). Without the flip, the
+near-frontal (~4°) predicted view is a chest X-ray rendered upside down (diaphragm curve at the top,
+apex/ribcage at the bottom) relative to ground truth. With the flip, the same view is right-side up and
+recognizably matches the ground-truth PA orientation. Confirms `DRRProjector`'s internal row convention is
+inverted relative to this project's `views/*.png` convention, exactly as the staged comment claimed.
+**Verification:** Direct visual before/after comparison against real GT (see session images); `uv run
+pytest baselines/tests/test_xraysyn_wrapper.py` passes.
+
+---
+
 ## 2026-08-03 — Initial XRaySyn Integration & Dynamic Pose Helpers
 
 **Phase:** 1 (Import & Environment)  

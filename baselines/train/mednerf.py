@@ -91,28 +91,48 @@ def train_mednerf(args: argparse.Namespace) -> None:
 
     logger.info(f"Found {len(train_patient_dirs)} train cases and {len(val_patient_dirs)} val cases for MedNeRF.")
 
-    def cache_pa_tensors(patient_dirs: list[str]) -> list[torch.Tensor]:
+    def cache_target_tensors(patient_dirs: list[str]) -> list[dict]:
         cached = []
 
         for pat_path in patient_dirs:
-            pa_file = os.path.join(pat_path, "pa.png")
-            if not os.path.exists(pa_file):
+            views_dir = os.path.join(pat_path, "views")
+            if not os.path.exists(views_dir):
+                pa_file = os.path.join(pat_path, "pa.png")
+                if os.path.exists(pa_file):
+                    pa_tensor = TF.to_tensor(Image.open(pa_file).convert("L")).unsqueeze(0)
+                    pa_tensor = TF.resize(pa_tensor, [H, W])
+                    cached.append({"tensors": [pa_tensor], "angles": [0.0]})
                 continue
 
-            pa_tensor = TF.to_tensor(Image.open(pa_file).convert("L")).unsqueeze(0)
-            pa_tensor = TF.resize(pa_tensor, [H, W])
-            cached.append(pa_tensor)
+            view_files = sorted(f for f in os.listdir(views_dir) if f.endswith(".png"))
+            if not view_files:
+                continue
+
+            tensors = [
+                TF.resize(TF.to_tensor(Image.open(os.path.join(views_dir, vf)).convert("L")).unsqueeze(0), [H, W])
+                for vf in view_files
+            ]
+            angles = list(np.linspace(0.0, 360.0, len(view_files)))
+            cached.append({"tensors": tensors, "angles": angles})
 
         return cached
 
-    train_cached_pa_tensors = cache_pa_tensors(
+    train_cached_tensors = cache_target_tensors(
         train_patient_dirs[:args.max_train_samples] if args.max_train_samples else train_patient_dirs
     )
 
-    val_cached_pa_tensors = cache_pa_tensors(val_patient_dirs)
-    if args.max_val_samples is not None and len(val_cached_pa_tensors) > args.max_val_samples:
-        val_cached_pa_tensors = val_cached_pa_tensors[:args.max_val_samples]
-        logger.info(f"Subsampled val set to {len(val_cached_pa_tensors)} cases for fast epoch evaluation.")
+    val_cached_tensors = cache_target_tensors(val_patient_dirs)
+    if args.max_val_samples is not None and len(val_cached_tensors) > args.max_val_samples:
+        val_cached_tensors = val_cached_tensors[:args.max_val_samples]
+        logger.info(f"Subsampled val set to {len(val_cached_tensors)} cases for fast epoch evaluation.")
+
+    # Fixed validation pairs with reproducible seed
+    val_rng = np.random.RandomState(42)
+    val_pairs = []
+    for item in val_cached_tensors:
+        n_views = len(item["tensors"])
+        tgt_idx = val_rng.randint(1, n_views) if n_views > 1 else 0
+        val_pairs.append((item["tensors"][tgt_idx], float(item["angles"][tgt_idx])))
 
     viz_patient_dir = val_patient_dirs[0] if val_patient_dirs else None
 
@@ -135,12 +155,15 @@ def train_mednerf(args: argparse.Namespace) -> None:
         epoch_train_loss = 0.0
         num_train_steps = 0
 
-        for pa_tensor in train_cached_pa_tensors:
-            pa_tensor = pa_tensor.to(device)
+        for item in train_cached_tensors:
+            n_views = len(item["tensors"])
+            tgt_idx = np.random.randint(0, n_views)
+            target_xr = item["tensors"][tgt_idx].to(device)
+            target_azimuth = float(item["angles"][tgt_idx])
 
             _, rec_loss = fit_latent_and_weights(
                 generator,
-                pa_tensor,
+                target_xr,
                 z_dim=z_dim,
                 img_size=H,
                 radius=radius,
@@ -148,6 +171,7 @@ def train_mednerf(args: argparse.Namespace) -> None:
                 device=device,
                 iterations=args.iters_per_sample,
                 use_amp=args.amp,
+                azimuth=target_azimuth,
             )
 
             epoch_train_loss += rec_loss
@@ -159,8 +183,8 @@ def train_mednerf(args: argparse.Namespace) -> None:
         epoch_val_loss = 0.0
         num_val_steps = 0
 
-        for pa_tensor in val_cached_pa_tensors:
-            pa_tensor = pa_tensor.to(device)
+        for target_xr, target_azimuth in val_pairs:
+            target_xr = target_xr.to(device)
 
             generator_val = copy.deepcopy(generator)
             generator_val.parameters = lambda: generator_val._parameters
@@ -168,13 +192,14 @@ def train_mednerf(args: argparse.Namespace) -> None:
 
             _, rec_loss = fit_latent_and_weights(
                 generator_val,
-                pa_tensor,
+                target_xr,
                 z_dim=z_dim,
                 img_size=H,
                 radius=radius,
                 theta_mean=theta_mean,
                 device=device,
                 iterations=args.val_iters_per_sample,
+                azimuth=target_azimuth,
             )
 
             epoch_val_loss += rec_loss

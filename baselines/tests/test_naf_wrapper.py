@@ -3,7 +3,7 @@ import pytest
 from models.naf import NAFWrapper
 
 def test_naf_wrapper_fallback_gracefully(mock_frontal_cxr):
-    wrapper = NAFWrapper()
+    wrapper = NAFWrapper(iterations=5)
     
     if wrapper.model is None:
         views = wrapper.infer_multi_views(mock_frontal_cxr)

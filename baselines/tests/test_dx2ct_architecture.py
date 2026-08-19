@@ -80,22 +80,22 @@ def test_spade_resnet_block(test_device):
 
 
 def test_denoising_unet_spade(test_device):
-    noisy_slice = torch.rand(2, 1, 256, 256, device=test_device)
-    condition = torch.rand(2, 128, 256, 256, device=test_device)
+    noisy_slice = torch.rand(2, 1, 64, 64, device=test_device)
+    condition = torch.rand(2, 128, 64, 64, device=test_device)
     
     unet = DenoisingUNetSPADE(in_channels=1, cond_channels=128).to(test_device)
     noise_pred = unet(noisy_slice, condition)
     
-    assert noise_pred.shape == (2, 1, 256, 256)
+    assert noise_pred.shape == (2, 1, 64, 64)
 
 
 def test_complete_dx2ct_model_pipeline(test_device):
     # Complete batch pass simulating slice-diffusion query step
-    noisy_slice = torch.rand(1, 1, 256, 256, device=test_device)
+    noisy_slice = torch.rand(1, 1, 64, 64, device=test_device)
     pa_xray = torch.rand(1, 1, 256, 256, device=test_device)
     lat_xray = torch.rand(1, 1, 256, 256, device=test_device)
     
-    # Grid coordinates mapping to axial pixels (flat sequence size 256*256)
+    # Grid coordinates mapping to axial pixels (flat sequence size 64*64 = 4096)
     # To keep memory footprint low in local test suite, we simulate a sequence of 1024 voxel queries
     coords_3d = torch.rand(1, 1024, 3, device=test_device)
     
@@ -112,9 +112,9 @@ def test_complete_dx2ct_model_pipeline(test_device):
         pos_aware_feats_flat = model.transformer_3dpqt(coords_3d, combined_xray_feats)
         assert pos_aware_feats_flat.shape == (1, 1024, 128)
         
-        # Verify full standard forward pass with 256*256 coordinate sequence mapping
-        full_coords = torch.rand(1, 256 * 256, 3, device=test_device)
+        # Verify full standard forward pass with 64*64 coordinate sequence mapping
+        full_coords = torch.rand(1, 64 * 64, 3, device=test_device)
         noise_prediction = model(noisy_slice, pa_xray, lat_xray, full_coords)
         
-        assert noise_prediction.shape == (1, 1, 256, 256)
+        assert noise_prediction.shape == (1, 1, 64, 64)
         assert not torch.isnan(noise_prediction).any()

@@ -1,5 +1,57 @@
 # NAF Change & Fix Log
 
+## 2026-08-16 — Seeded Off-Axis Validation View Sampling
+
+**Phase:** 2 (Training & Validation Parity)  
+**Files:** `baselines/train/naf.py`  
+**Change:** Updated `train_naf.py` validation loop to use `val_rng = np.random.RandomState(42)` for selecting deterministic off-axis validation target views (`val_pairs`) instead of hard-pinning index 0 ($0^\circ$).  
+**Why:** Ensures validation loss (`avg_val_loss`) accurately measures off-axis novel-view fitting quality during training, matching SV-DRR's seeded validation protocol.  
+**Verification:** All unit and regression tests pass cleanly.
+
+---
+
+## 2026-08-14 — Fixed Baked-Grid Axis-Swap Bug in `sample_fn`; Confirmed Residual Comb Artifact Is a Method Limitation, Not a Bug
+
+**Phase:** 2 (Correctness)
+**Files:** `baselines/models/naf.py`
+**Change:** `infer_multi_views`'s `sample_fn(pts)` (queries the dense-baked `attenuations` grid via
+`F.grid_sample`) now permutes `pts` to `pts[..., [2, 1, 0]]` before normalizing/clamping.
+**Why:** `attenuations` is baked via `torch.stack(torch.meshgrid(grid, grid, grid, indexing="ij"), dim=-1)`
+stacked in `(x_world, y_world, z_world)` order, giving the 5D tensor axes `(D=x_world, H=y_world,
+W=z_world)`. `F.grid_sample` reads `grid[...,0]→W`, `[...,1]→H`, `[...,2]→D` — so an unpermuted
+`(x,y,z)` query lands `x_world` on the `D` axis and `z_world` on the `W` axis, i.e. exactly backwards.
+Found this independently while investigating why `results/naf.png` (Images/val_multiview panel) looked
+like radiating comb-pattern noise instead of chest anatomy — the same class of bug a concurrent Copilot
+pass had just (incorrectly, see `docs/baselines/dx2ct/LOG.md`'s same-date entry) tried to fix in
+`dx2ct.py`.
+**Verification:** Empirical, not just derived: baked a synthetic single-voxel marker tensor at a known
+`(i0,j0,k0)`, queried `sample_fn` at the exact world-coordinate the marker was placed at — the unpermuted
+query returned `0.0` (missed the marker entirely), the `[2,1,0]`-permuted query returned `~1.0` (correct
+hit). `uv run pytest baselines/tests/test_naf_wrapper.py` still passes.
+**Residual finding (not a bug, left as-is):** After this fix, `infer_multi_views` on a real NSCLC test
+patient (no checkpoint needed — NAF fits per-scan) still shows a severe "comb"/interference artifact at
+azimuths near the single fit view (0°/~4°/~190°), while azimuths far from it show smooth-but-wrong
+banding. Ruled out three alternative causes by direct experiment before concluding this: (1) bypassing the
+baked grid entirely and querying the coordinate MLP directly per ray sample — pattern unchanged; (2)
+raising per-scan fit iterations 200→1500 — pattern unchanged (got slightly sharper, not weaker); (3)
+matching the render grid resolution to the fit resolution (128→64) — pattern reduced but not eliminated.
+A direct self-consistency check (render azimuth=0 immediately after fitting to it) reproduces the fit
+target reasonably well (MSE ≈0.0027), so the field *does* fit its one supervised view — it just collapses
+to a thin, nearly-2D density slab at that view (the classic shape-radiance/thin-slab degeneracy for a
+coordinate field fit from a *single* 2D projection with no cross-view constraint), and any ray that isn't
+close to parallel to the fit view grazes that slab at a steep angle, producing dense fringing. This matches
+`research-state.yaml`'s own H1 hypothesis (reconstruction-based NVS baselines suffer severe artifacts on
+single-view OOD input) and NAF's intended use case (CBCT reconstruction from dozens of angularly-diverse
+projections, not one) — not something a further code fix in this wrapper should chase.
+**Follow-up same day:** pulled `gs://.../checkpoints/cosmos-worker-1/naf_best.pt` (57MB) from GCS and re-ran
+against the same real patient, initializing the per-scan fit from these pretrained weights instead of
+`NAFWrapper`'s default random init. Output is visually indistinguishable from the random-init run — expected,
+since `infer_multi_views` always re-fits ~200 gradient steps per scan regardless of the starting point, and
+both converge to the same single-view thin-slab degeneracy. Confirms the checkpoint choice is irrelevant to
+this baseline's quality (unlike the other 5), consistent with NAF's architecture.
+
+---
+
 ## 2026-08-03 — Initial NAF Integration & Beer-Lambert Physics Correction
 
 **Phase:** 1 & 2 (Import & Correctness)  
@@ -45,3 +97,12 @@ for this entry too, since both extensions depend on the same base-image/torch CU
 independently re-verify `NAF_HASHENCODER_AVAILABLE` inside the rebuilt container specifically (would
 require actually running `baselines/train/naf.py` inside it) -- worth confirming on the next real NAF
 training run's log output rather than assuming.
+---
+
+## 2026-08-15 — Target Azimuth Sampling Across Full 93-View Cache
+
+**Phase:** 2 (Training Protocol / View Representation)  
+**Files:** `baselines/models/naf.py`, `baselines/train/naf.py`  
+**Change:** Updated `fit_density_field` to take `azimuth: float = 0.0`. Updated `train_naf` to load pre-rendered views and angles and sample random target view angles `(target_proj, target_azimuth)` during density field fitting.  
+**Why:** Prevents per-scan density field fitting from overfitting to 0° frontal projection during training, optimizing NAF rays across the full $360^\circ$ sweep.  
+**Verification:** `python run_all_tests_isolate.py` passes all unit tests.

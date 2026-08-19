@@ -40,7 +40,7 @@ To verify geometric generalization capabilities (directly addressing MICCAI Revi
 
 ### A. Dataset Partitioning
 - **Training & Validation Split (1,296 total volumes):** Combined **TCIA (771 volumes)** + **MELA (525 volumes)**.
-- **Unseen Evaluation Split (402 volumes):** **NSCLC Radiogenomics (402 volumes)**.
+- **Unseen Evaluation Split (402 volumes):** **NSCLC-Radiomics (LUNG1, 402 volumes)**.
 - *Strict Rule:* All Direct Baselines must be retrained completely from scratch on the TCIA+MELA split. Evaluation metrics are measured exclusively on the unseen NSCLC domain.
 
 ### B. Dataset Physical & Intensity Statistics

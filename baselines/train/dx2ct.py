@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import sys
 
@@ -183,7 +184,7 @@ class CrossDatasetSliceDataset(Dataset):
         # 1. Resize input projections
         pa = TF.resize(TF.to_tensor(pa_img), [256, 256])
         lat = TF.resize(TF.to_tensor(lat_img), [256, 256])
-        spatial_size = 64
+        spatial_size = 128
 
         # 2. Extract random axial slices from CT volume
         K = self.slices_per_volume
@@ -273,6 +274,29 @@ def train_dx2ct(args: argparse.Namespace) -> None:
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
 
+    # LR warmup + cosine decay and gradient clipping: Dx2CT trains from a random
+    # init (not a fine-tune of a pretrained checkpoint like SV-DRR), which is
+    # exactly the regime both of these matter most for -- warmup protects against
+    # early-training instability, clipping guards against occasional large
+    # gradients while the model is still finding its footing. No sibling reference
+    # implementation exists for Dx2CT (unlike SV-DRR/XRaySyn's Cosmos-NVSyn
+    # counterparts) to verify these against, so defaults are chosen from general
+    # diffusion-training practice, not a known-working config: warmup_steps=500
+    # matches SV-DRR's; gradient_clip_val=1.0 matches XRaySyn's own
+    # clip_grad_norm_ convention (baselines/cloned/XraySyn/xraysyn/models/
+    # ct2xray_real_gan_meta.py) rather than SV-DRR's DiT-specific 0.5.
+    steps_per_epoch = len(train_loader) if args.max_batches is None else min(len(train_loader), args.max_batches)
+    max_train_steps = args.epochs * steps_per_epoch
+    min_lr_ratio = 0.1
+
+    def lr_lambda(step: int) -> float:
+        if step < args.warmup_steps:
+            return step / max(1, args.warmup_steps)
+        progress = min(1.0, (step - args.warmup_steps) / max(1, max_train_steps - args.warmup_steps))
+        return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
     ckpt_dir = os.path.join(BASE_DIR, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
@@ -305,6 +329,21 @@ def train_dx2ct(args: argparse.Namespace) -> None:
             target_slice = target_slice.to(device, non_blocking=True)
             coords_3d = coords_3d.to(device, non_blocking=True)
 
+            # Monoplanar dropout: baselines/models/dx2ct.py's infer_multi_views (the
+            # only way this baseline is ever actually evaluated, per this project's
+            # single-view benchmark protocol) duplicates the PA image into the
+            # lateral slot rather than supplying a real second view. Without this,
+            # the model never sees that exact input distribution during training --
+            # it always gets a genuine, different lat.png here -- so at inference
+            # it's fed something out of its training distribution. Replacing lat
+            # with a PA duplicate on a fraction of training samples closes that gap
+            # while keeping the rest of training on real biplanar pairs.
+            if args.lat_dropout_prob > 0:
+                drop_mask = torch.rand(pa.shape[0], device=device) < args.lat_dropout_prob
+                if drop_mask.any():
+                    lat = lat.clone()
+                    lat[drop_mask] = pa[drop_mask]
+
             noise = torch.randn_like(target_slice)
             B = target_slice.shape[0]
 
@@ -316,7 +355,10 @@ def train_dx2ct(args: argparse.Namespace) -> None:
             loss = criterion(noise_pred, noise)
 
             loss.backward()
+            if args.gradient_clip_val > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.gradient_clip_val)
             optimizer.step()
+            lr_scheduler.step()
 
             epoch_train_loss += loss.detach()
             num_train_batches += 1
@@ -346,6 +388,13 @@ def train_dx2ct(args: argparse.Namespace) -> None:
                 target_slice = target_slice.to(device, non_blocking=True)
                 coords_3d = coords_3d.to(device, non_blocking=True)
 
+                # Always monoplanar here, not a dropout probability: this is the one
+                # and only condition infer_multi_views ever actually evaluates under,
+                # so best-checkpoint selection (avg_val_loss below) should track that
+                # real deployment condition rather than an easier real-biplanar signal
+                # this baseline never gets to use.
+                lat = pa
+
                 noise = torch.randn(target_slice.shape, generator=val_generator, device=device)
                 B = target_slice.shape[0]
 
@@ -361,9 +410,11 @@ def train_dx2ct(args: argparse.Namespace) -> None:
         avg_val_loss = (epoch_val_loss / max(1, num_val_batches)).item()
 
         # --- Logging & TensorBoard --- #
-        logger.info(f"Epoch [{epoch}/{args.epochs}] - Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+        current_lr = lr_scheduler.get_last_lr()[0]
+        logger.info(f"Epoch [{epoch}/{args.epochs}] - Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f} | LR: {current_lr:.2e}")
         writer.add_scalar("Loss/train", avg_train_loss, epoch)
         writer.add_scalar("Loss/val", avg_val_loss, epoch)
+        writer.add_scalar("LR/model", current_lr, epoch)
 
         if args.viz_every > 0 and (epoch % args.viz_every == 0 or epoch == args.epochs) and viz_patient_dir is not None:
             pa_path = os.path.join(viz_patient_dir, "pa.png")
@@ -419,6 +470,9 @@ if __name__ == "__main__":
     parser.add_argument("--max_val_batches", type=int, default=None, help="Max validation batches per epoch")
     parser.add_argument("--viz_every", type=int, default=10, help="Log multi-view TensorBoard panel every N epochs (0 to disable)")
     parser.add_argument("--viz_views", type=int, default=6, help="Number of azimuths per multi-view panel")
+    parser.add_argument("--lat_dropout_prob", type=float, default=0.5, help="Probability of replacing the real lateral view with a PA duplicate during training, matching infer_multi_views' monoplanar inference input")
+    parser.add_argument("--warmup_steps", type=int, default=500, help="LR warmup steps before cosine decay begins")
+    parser.add_argument("--gradient_clip_val", type=float, default=1.0, help="Gradient clipping max norm (0 to disable)")
 
     args = parser.parse_args()
     train_dx2ct(args)

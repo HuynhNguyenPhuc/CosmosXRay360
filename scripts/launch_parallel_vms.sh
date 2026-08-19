@@ -6,13 +6,11 @@
 # Automatically shuts down each VM upon completion.
 #
 # Default Worker Pairing:
-#   - Worker 1 (cosmos-worker-1): Dx2CT + NAF
-#   - Worker 2 (cosmos-worker-2): XRaySyn only (SV-DRR now lives on worker-4's
-#     dedicated A100 below -- worker-2 no longer pairs the two)
-#   - Worker 3 (cosmos-worker-3): PixelNeRF + MedNeRF
-#   - Worker 4 (cosmos-worker-4): SV-DRR only (dedicated A100 slot -- needs a
-#     larger --batch_size/--accum_steps via --extra-args than the L4 default)
-#   - Worker 5 (cosmos-worker-5): PixelNeRF + MedNeRF (second slot)
+#   - Worker 1 (cosmos-worker-1): NAF only
+#   - Worker 2 (cosmos-worker-2): XRaySyn only
+#   - Worker 3 (cosmos-worker-3): Dx2CT only (dedicated A100 40GB slot)
+#   - Worker 4 (cosmos-worker-4): SV-DRR only (dedicated A100 40GB slot)
+#   - Worker 5 (cosmos-worker-5): PixelNeRF + MedNeRF
 # =====================================================================
 
 set -e
@@ -42,10 +40,11 @@ declare -A WORKER_OVERRIDE          # worker_name -> "baseline1[,baseline2]"
 declare -A ONLY_WORKERS             # worker_name -> 1 (filter launched workers)
 # Extra CLI args per baseline (appended after --epochs)
 declare -A BASELINE_EXTRA_ARGS=(
-    [svdrr]="--patience 50 --batch_size 8 --accum_steps 8"
+    [svdrr]="--batch_size 16 --accum_steps 4"
 )
-# Instance template per worker (default: L4 template; worker-4 defaults to dedicated A100 template)
+# Instance template per worker (default: L4 template; worker-3 & worker-4 default to dedicated A100 template)
 declare -A WORKER_TEMPLATE_OVERRIDE=(
+    [cosmos-worker-3]="cosmosxray360-a100-trainer-template"
     [cosmos-worker-4]="cosmosxray360-a100-trainer-template"
 )
 
@@ -235,7 +234,7 @@ fi
 # Check for pre-rendered dataset cache in GCS before raw download + render
 if gsutil -q ls "gs://$GCS_BUCKET/pre_rendered_cache/pre_rendered/train/" >/dev/null 2>&1; then
     echo "▶ Found pre-rendered dataset cache in GCS -- downloading directly..."
-    gsutil -m cp -r "gs://$GCS_BUCKET/pre_rendered_cache/pre_rendered" datasets/
+    gcloud storage cp -r "gs://$GCS_BUCKET/pre_rendered_cache/pre_rendered" datasets/
 else
     echo "▶ No pre-rendered cache in GCS -- downloading raw dataset volumes..."
     docker run --gpus all --rm --ipc=host \
@@ -254,14 +253,16 @@ else
     gsutil -m cp -r datasets/pre_rendered "gs://$GCS_BUCKET/pre_rendered_cache/" || true
 fi
 
-# Ensure raw 3D CT dataset volumes (TCIA & MELA2022) are present (needed by 3D volume tasks like Dx2CT)
-if [ ! -d "datasets/TCIA" ] || [ ! -d "datasets/MELA2022" ]; then
-    echo "▶ Downloading raw 3D CT dataset volumes (TCIA & MELA2022)..."
-    docker run --gpus all --rm --ipc=host \
-        -e HF_TOKEN="$HF_TOKEN" \
-        -v \$(pwd)/datasets:/workspace/datasets \
-        cosmos_baselines \
-        python3 scripts/fast_download.py --percentage 1.0 --max_workers $DOWNLOAD_MAX_WORKERS || true
+# Ensure raw 3D CT dataset volumes (TCIA & MELA2022) are present (only needed by 3D CT slice tasks like Dx2CT)
+if [ "$BASELINE_1" = "dx2ct" ] || [ "$BASELINE_2" = "dx2ct" ]; then
+    if [ ! -d "datasets/TCIA" ] || [ ! -d "datasets/MELA2022" ]; then
+        echo "▶ [Dx2CT] Downloading raw 3D CT dataset volumes (TCIA & MELA2022)..."
+        docker run --gpus all --rm --ipc=host \
+            -e HF_TOKEN="$HF_TOKEN" \
+            -v \$(pwd)/datasets:/workspace/datasets \
+            cosmos_baselines \
+            python3 scripts/fast_download.py --percentage 1.0 --max_workers $DOWNLOAD_MAX_WORKERS || true
+    fi
 fi
 
 # Execute assigned Baseline 1
@@ -292,11 +293,14 @@ EOF
         STARTUP_SCRIPT_FILE="$(mktemp)"
         printf '%s' "$STARTUP_SCRIPT" > "$STARTUP_SCRIPT_FILE"
 
-        # Candidate zones tailored by accelerator type (A100 vs L4) to avoid invalid machine-type errors
+        # Candidate zones tailored by accelerator type (A100 vs L4) to avoid invalid machine-type errors.
+        # us-central1-* is listed first in both: GCS_BUCKET is a regional (US-CENTRAL1) bucket, and
+        # datasets/pre_rendered is pulled from it on every worker boot -- same-region zones avoid
+        # cross-region GCS egress for that ~30GB+ transfer.
         if [[ "$WORKER_TEMPLATE" == *"a100"* ]]; then
             CANDIDATE_ZONES=("us-central1-a" "us-central1-b" "us-central1-c" "us-central1-f" "us-east1-b" "us-west1-b" "europe-west4-a" "europe-west4-b" "asia-southeast1-a" "asia-northeast1-a")
         else
-            CANDIDATE_ZONES=("us-east1-c" "us-west1-a" "us-east1-d" "us-east1-b" "us-west1-b" "us-west1-c" "us-central1-a" "us-central1-b" "us-central1-c" "europe-west1-b")
+            CANDIDATE_ZONES=("us-central1-a" "us-central1-b" "us-central1-c" "us-east1-c" "us-west1-a" "us-east1-d" "us-east1-b" "us-west1-b" "us-west1-c" "europe-west1-b")
         fi
         LAUNCH_SUCCESS=false
 
@@ -367,10 +371,11 @@ maybe_launch_worker() {
     launch_worker "$WORKER_NAME" "$BASELINE_1" "$BASELINE_2" "$STAGGER_SECONDS"
 }
 
-maybe_launch_worker "cosmos-worker-1" "dx2ct" "naf" 0
-maybe_launch_worker "cosmos-worker-2" "xraysyn" "" "$DOWNLOAD_STAGGER_SECONDS"
-maybe_launch_worker "cosmos-worker-4" "svdrr" "" "$((DOWNLOAD_STAGGER_SECONDS * 2))"
-maybe_launch_worker "cosmos-worker-5" "pixelnerf" "mednerf" "$((DOWNLOAD_STAGGER_SECONDS * 3))"
+maybe_launch_worker "cosmos-worker-1" "naf" "" 0
+maybe_launch_worker "cosmos-worker-2" "xraysyn" "" "$((DOWNLOAD_STAGGER_SECONDS * 1))"
+maybe_launch_worker "cosmos-worker-3" "dx2ct" "" "$((DOWNLOAD_STAGGER_SECONDS * 2))"
+maybe_launch_worker "cosmos-worker-4" "svdrr" "" "$((DOWNLOAD_STAGGER_SECONDS * 3))"
+maybe_launch_worker "cosmos-worker-5" "pixelnerf" "mednerf" "$((DOWNLOAD_STAGGER_SECONDS * 4))"
 
 echo ""
 echo "====================================================================="

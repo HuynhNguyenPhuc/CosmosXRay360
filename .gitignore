@@ -222,6 +222,12 @@ cache/
 *_cache/
 t5_xxl/
 
+# Tensorboard
+tensorboard/
+
+# Results
+results/
+
 # Checkpoints
 checkpoints
 

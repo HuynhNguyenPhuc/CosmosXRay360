@@ -64,6 +64,10 @@ class UnifiedBaselineEvaluator:
             if os.path.exists(path):
                 logger.info(f"Using checkpoint for {prefix}: {path}")
                 return path
+            path_sub = os.path.join(self.checkpoint_dir, prefix, name)
+            if os.path.exists(path_sub):
+                logger.info(f"Using checkpoint for {prefix}: {path_sub}")
+                return path_sub
         return os.path.join("eval_outputs", f"{prefix}_checkpoint.pt")
 
     def _init_baselines(self) -> None:

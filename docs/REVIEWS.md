@@ -45,7 +45,7 @@ This document provides the complete, structured deconstruction of all reviewer c
   * Thiếu so sánh với MedNeRF (dựa trên NeRF reconstruction) và Dx2CT (dựa trên diffusion).
   * Cần retrain toàn bộ 6 baseline SOTA trên cùng tập dữ liệu OOD.
 * **Technical Action Plan:**
-  * **Cross-Dataset OOD Protocol:** Train/Val on **TCIA (771 cases) + MELA (525 cases)** = $1,296$ volumes; Test on unseen **NSCLC Radiogenomics (402 cases)**.
+  * **Cross-Dataset OOD Protocol:** Train/Val on **TCIA (771 cases) + MELA (525 cases)** = $1,296$ volumes; Test on unseen **NSCLC-Radiomics (LUNG1, 402 cases)**.
   * **Retrain 6 Baselines:** Retrain **Dx2CT**, **SV-DRR**, **MedNeRF**, **NAF**, **PixelNeRF**, and **XRaySyn** under standardized DiffDRR Siddon-Jacob projection rendering.
   * **Quantitative Benchmarking:** Compile PSNR, SSIM, and Inference Latency into Table 1 (`PROPOSAL.md` Section 2.3).
 

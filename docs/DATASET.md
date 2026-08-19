@@ -129,6 +129,12 @@ stretched along the $Z$-axis) and biases cross-dataset comparison.
 **Resolution.** Resample all volumes to a uniform $1.0 \times 1.0 \times 1.0\text{ mm}$ isotropic
 resolution via trilinear interpolation prior to rendering (pipeline stage 2, Figure 2).
 
+### 3.3 Scan Reconstruction Artifacts & Quality Control (Exclusion of `mela_0005`)
+
+**Reconstruction streak artifacts.** While intensity clipping at $[-1024, 1500]\text{ HU}$ prevents contrast collapse caused by extreme HU outlier spikes (§3.1), severe metal implants or scan acquisition discontinuities can still introduce structural streak and boundary seam artifacts into pre-rendered DRR projections. For instance, patient `mela_0005` in the MELA2022 cohort exhibits a hard horizontal and vertical seam artifact baked into its source CT volume, producing corrupted 2D projections (`pa.png` and `views/*.png`).
+
+**Resolution.** To prevent corrupted scans from contaminating baseline training loops or visualization metrics, dataset loading functions (`get_train_val_patient_dirs` in `baselines/models/utils.py`) enforce an explicit exclusion list (`exclude_patients={"mela_0005"}`) during dataset partitioning.
+
 ---
 
 ## 4. Quantitative Grid Search: HU Window Selection

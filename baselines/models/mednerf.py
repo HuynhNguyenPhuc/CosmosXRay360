@@ -66,6 +66,7 @@ def fit_latent_and_weights(
     device: str,
     iterations: int = 500,
     use_amp: bool = False,
+    azimuth: float = 0.0,
 ) -> tuple["torch.Tensor", float]:
     """Jointly optimizes latent code z and generator weights to reconstruct target X-ray.
 
@@ -79,6 +80,7 @@ def fit_latent_and_weights(
         device: Compute device.
         iterations: Number of optimization steps.
         use_amp: If True, uses torch.autocast for mixed precision.
+        azimuth: View azimuth angle in degrees.
 
     Returns:
         Tuple of (optimized latent z [1, z_dim], final reconstruction loss).
@@ -90,8 +92,8 @@ def fit_latent_and_weights(
     z_optim = optim.Adam([z], lr=0.0005, betas=(0.0, 0.999))
     g_optim = optim.RMSprop(generator_test.parameters(), lr=0.0005, alpha=0.99, eps=1e-8)
 
-    # Frontal pose for input X-ray
-    pose = get_render_poses(radius=radius, angle_range=(0, 0), theta=theta_mean, N=1)
+    # Pose for input X-ray at specified azimuth
+    pose = get_render_poses(radius=radius, angle_range=(azimuth, azimuth), theta=theta_mean, N=1)
     pose = pose[0].to(device)
     rays = generator_test.val_ray_sampler(
         img_size, img_size, generator_test.focal, pose

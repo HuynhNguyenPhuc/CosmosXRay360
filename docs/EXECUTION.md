@@ -18,8 +18,8 @@ This document provides a comprehensive, actionable guide on how to configure, re
   *(Note: `ninja` supports rapid JIT compilation of CUDA C++ extensions required by baseline modules.)*
 - **Hardware Accelerator:** NVIDIA TITAN RTX (24GB VRAM).
 - **Pre-rendered Dataset Status:**
-  - `datasets/pre_rendered/train`: 387 verified patient cases (TCIA + MELA2022 = 1,296 total volumes).
-  - `datasets/pre_rendered/test`: 241 verified patient cases (NSCLC Radiogenomics = 402 total volumes).
+  - `datasets/pre_rendered/train`: 1,223 verified patient cases (TCIA + MELA2022).
+  - `datasets/pre_rendered/test`: 402 verified patient cases (NSCLC-Radiomics LUNG1).
 
 ---
 

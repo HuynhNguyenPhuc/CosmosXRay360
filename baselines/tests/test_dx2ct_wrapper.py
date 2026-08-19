@@ -24,8 +24,10 @@ def test_dx2ct_wrapper_inference(mock_frontal_cxr, test_device):
     if wrapper.model is None or wrapper.scheduler is None:
         pytest.skip("Required libraries not available")
     
-    # Run mock inference for 2 azimuth views
-    views = wrapper.infer_multi_views(mock_frontal_cxr, azimuths=(0, 360, 2))
+    # Run mock inference for 2 azimuth views with reduced slice count and DDIM steps for unit testing
+    views = wrapper.infer_multi_views(
+        mock_frontal_cxr, azimuths=(0, 360, 2), num_slices=16, num_inference_steps=2,
+    )
     
     assert len(views) == 2
     for view in views:

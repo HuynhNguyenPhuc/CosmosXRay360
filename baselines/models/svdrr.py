@@ -86,7 +86,9 @@ class SVDRRWrapper:
             
             if state is not None:
                 if "transformer" in state:
-                    self.pipe.transformer.load_state_dict(state["transformer"])
+                    # Load EMA transformer weights if available; fall back to raw transformer.
+                    transformer_state = state.get("ema_transformer") or state["transformer"]
+                    self.pipe.transformer.load_state_dict(transformer_state)
                     self.pipe.cc_projection.load_state_dict(state["cc_projection"])
                 else:
                     self.pipe.transformer.load_state_dict(state)
@@ -104,6 +106,8 @@ class SVDRRWrapper:
         self,
         input_xr: torch.Tensor,
         azimuths: tuple[float, float, int] = (0, 360, 93),
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        seed: int | None = None,
     ) -> list[torch.Tensor]:
         """Synthesizes novel views over specified angles."""
         if self.pipe is None:
@@ -132,6 +136,9 @@ class SVDRRWrapper:
 
             azim_range = np.linspace(azimuths[0], azimuths[1], azimuths[2])
 
+            if generator is None and seed is not None:
+                generator = torch.Generator(device=self.device).manual_seed(seed)
+
             VIEW_BATCH = 16
 
             for start in range(0, len(azim_range), VIEW_BATCH):
@@ -139,16 +146,21 @@ class SVDRRWrapper:
                 n = len(chunk)
                 poses = [[0, -float(azimuth), 0] for azimuth in chunk]
 
+                pipe_kwargs = {
+                    "input_imgs": [input_img] * n,
+                    "prompt_imgs": [input_img] * n,
+                    "poses": poses,
+                    "height": 256,
+                    "width": 256,
+                    # Reference evaluation parameters (guidance scale 3.0, 30 steps).
+                    "guidance_scale": 3.0,
+                    "num_inference_steps": 30,
+                }
+                if generator is not None:
+                    pipe_kwargs["generator"] = generator
+
                 with torch.no_grad():
-                    result = self.pipe(
-                        input_imgs=[input_img] * n,
-                        prompt_imgs=[input_img] * n,
-                        poses=poses,
-                        height=256,
-                        width=256,
-                        guidance_scale=3.0,
-                        num_inference_steps=20,
-                    )
+                    result = self.pipe(**pipe_kwargs)
 
                     for out_img in result.images:
                         out_tensor = (

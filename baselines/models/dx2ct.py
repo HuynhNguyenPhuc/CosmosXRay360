@@ -19,7 +19,7 @@ except ImportError:
     warnings.warn("PyTorch or NumPy not available")
 
 try:
-    from diffusers import DDPMScheduler
+    from diffusers import DDIMScheduler
     DIFFUSERS_AVAILABLE = True
 except ImportError:
     DIFFUSERS_AVAILABLE = False
@@ -69,7 +69,21 @@ class Dx2CTWrapper:
         
         try:
             self.model = DX2CTModel(embed_dim=128).to(self.device)
-            self.scheduler = DDPMScheduler(num_train_timesteps=1000)
+            # DDIM, not DDPM: the paper's own stated sampling protocol (§3, "Reported
+            # Training & Evaluation Setup") is "DDIM, 50 steps; the initial noise x_T
+            # is fixed and DDIM's random noise term removed, specifically to keep
+            # slice-to-slice reconstruction consistent within one volume." DDPMScheduler
+            # injects fresh stochastic noise at every reverse step for every
+            # independently-sampled slice -- the opposite of that, and a direct,
+            # paper-documented cause of the comb/streak artifacts at oblique azimuths.
+            # eta=0.0 (DDIMScheduler's default) already gives the deterministic,
+            # noise-term-free step the paper specifies. Betas set explicitly to match
+            # the DDPMScheduler(beta_start=0.0001, beta_end=0.02, beta_schedule="linear")
+            # baselines/train/dx2ct.py trains against, rather than relying on both
+            # classes' defaults happening to agree.
+            self.scheduler = DDIMScheduler(
+                num_train_timesteps=1000, beta_start=0.0001, beta_end=0.02, beta_schedule="linear",
+            )
             
             checkpoint_loaded = False
             if checkpoint_path and os.path.exists(checkpoint_path):
@@ -93,12 +107,16 @@ class Dx2CTWrapper:
         self,
         input_xr: torch.Tensor,
         azimuths: tuple[float, float, int] = (0, 360, 93),
+        num_slices: int = 128,
+        num_inference_steps: int = 50,
     ) -> list[torch.Tensor]:
         """Reconstructs 3D volume slice-by-slice and generates projection list at desired angles.
 
         Args:
             input_xr: Input 2D projection CXR [1, 1, 256, 256].
             azimuths: Target view boundaries as (start_angle, end_angle, N_views).
+            num_slices: Number of axial slices to reconstruct (default 128 matching paper).
+            num_inference_steps: Number of DDIM denoising steps (default 50 matching paper).
 
         Returns:
             A list of N synthesized 2D novel-view radiography tensors.
@@ -122,8 +140,7 @@ class Dx2CTWrapper:
                 pa_xray = input_xr
                 lat_xray = input_xr
                 
-                num_slices = 32
-                spatial_size = 64
+                spatial_size = 128
                 
                 # Generate 3D grid coordinates
                 grid_y, grid_x = torch.meshgrid(
@@ -132,8 +149,9 @@ class Dx2CTWrapper:
                     indexing="ij"
                 )
                 
-                # Batched DDIM denoising across slices
-                self.scheduler.set_timesteps(20)
+                # Batched DDIM denoising across slices. 50 steps matches the paper's
+                # stated sampling protocol.
+                self.scheduler.set_timesteps(num_inference_steps)
 
                 z_vals = -1.0 + 2.0 * torch.arange(num_slices, device=self.device) / max(1, num_slices - 1)
                 coords_3d = torch.stack([
@@ -146,7 +164,12 @@ class Dx2CTWrapper:
                 pa_batched = pa_xray.repeat_interleave(num_slices, dim=0)
                 lat_batched = lat_xray.repeat_interleave(num_slices, dim=0)
 
-                slice_t = torch.randn(B * num_slices, 1, spatial_size, spatial_size, device=self.device)
+                # One shared initial noise map per input batch item, repeated across
+                # that item's num_slices -- not independent per-slice noise. This is
+                # the paper's "fixed x_T" half of its slice-consistency sampling
+                # protocol (the other half is the deterministic DDIM step above).
+                base_noise = torch.randn(B, 1, spatial_size, spatial_size, device=self.device)
+                slice_t = base_noise.repeat_interleave(num_slices, dim=0)
 
                 for t in self.scheduler.timesteps:
                     t_batch = torch.full((B * num_slices,), t, device=self.device, dtype=torch.long)
@@ -156,6 +179,8 @@ class Dx2CTWrapper:
                 vol_pred = slice_t.view(B, num_slices, spatial_size, spatial_size).unsqueeze(1)
 
                 def sample_fn(pts: torch.Tensor) -> torch.Tensor:
+                    # pts is (x, y, z). vol_pred has shape (D=z, H=y, W=x), matching
+                    # grid_sample's expected (x, y, z) input order for (D, H, W) volumes.
                     grid_coords = pts.view(1, 1, 1, -1, 3)
                     sampled = F.grid_sample(
                         vol_pred, grid_coords, mode="bilinear",

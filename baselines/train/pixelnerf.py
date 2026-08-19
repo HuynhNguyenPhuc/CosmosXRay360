@@ -110,11 +110,15 @@ def train_pixelnerf(args: argparse.Namespace) -> None:
 
         return cached
 
-    def sample_train_target(item: dict) -> tuple[torch.Tensor, float]:
-        """Sample a random non-source target view."""
+    def sample_train_pair(item: dict) -> tuple[torch.Tensor, float, torch.Tensor, float]:
+        """Sample a random (source_view, source_azimuth, target_view, target_azimuth) pair."""
         n_views = item["views"].shape[0]
-        tgt_idx = np.random.randint(1, n_views)
-        return item["views"][tgt_idx].unsqueeze(0), float(item["angles"][tgt_idx])
+        src_idx, tgt_idx = np.random.choice(n_views, size=2, replace=False)
+        src_img = item["views"][src_idx].unsqueeze(0)
+        src_az = float(item["angles"][src_idx])
+        tgt_img = item["views"][tgt_idx].unsqueeze(0)
+        tgt_az = float(item["angles"][tgt_idx])
+        return src_img, src_az, tgt_img, tgt_az
 
     train_cached_tensors = cache_train_tensors(
         train_patient_dirs[:args.max_train_samples] if args.max_train_samples else train_patient_dirs
@@ -147,13 +151,13 @@ def train_pixelnerf(args: argparse.Namespace) -> None:
         num_train_steps = 0
 
         for item in train_cached_tensors:
-            pa_tensor = item["pa"].to(device)
-            target_tensor, target_azimuth = sample_train_target(item)
+            src_tensor, src_azimuth, target_tensor, target_azimuth = sample_train_pair(item)
+            src_tensor = src_tensor.to(device)
             target_tensor = target_tensor.to(device)
 
             optimizer.zero_grad(set_to_none=True)
 
-            encode_source_view(model, pa_tensor, device)
+            encode_source_view(model, src_tensor, device, source_azimuth=src_azimuth)
 
             rgb_coarse, rgb_fine = render_view(
                 render_wrapper, target_azimuth, RENDER_RES, device, return_coarse=True

@@ -1,6 +1,7 @@
+import os
 import torch
 import pytest
-from models.utils import compute_psnr, compute_ssim, compute_lpips, apply_beer_lambert_correction
+from models.utils import compute_psnr, compute_ssim, compute_lpips, apply_beer_lambert_correction, get_train_val_patient_dirs
 
 def test_psnr_identical():
     # PSNR of identical tensors should be 100.0 (by definition/implementation)
@@ -58,3 +59,19 @@ def test_beer_lambert_physics():
     attenuation_zero = torch.tensor([0.0])
     trans_zero = apply_beer_lambert_correction(attenuation_zero)
     assert abs(trans_zero.item() - 1.0) < 1e-5
+
+
+def test_get_train_val_patient_dirs_excludes_corrupt_patients(tmp_path):
+    train_dir = tmp_path / "train"
+    train_dir.mkdir()
+    (train_dir / "mela_0001").mkdir()
+    (train_dir / "mela_0002").mkdir()
+    (train_dir / "mela_0005").mkdir()
+
+    train_dirs, val_dirs = get_train_val_patient_dirs(str(tmp_path))
+    all_dirs = train_dirs + val_dirs
+    dir_names = [os.path.basename(d) for d in all_dirs]
+    assert "mela_0005" not in dir_names
+    assert "mela_0001" in dir_names
+    assert "mela_0002" in dir_names
+

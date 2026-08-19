@@ -82,3 +82,12 @@ signal did.
 and saves checkpoints. The previous checkpoint (trained under the fixed-90°-only setup, which already
 showed an overfitting signal by epoch 8) needs a full retrain under this fix before any new benchmark
 number is trusted — not yet done as of this entry.
+---
+
+## 2026-08-15 — Full Random Source-Target Pair Sampling from 93-View Cache
+
+**Phase:** 2 (Training Protocol / Representation Generalization)  
+**Files:** `baselines/models/pixelnerf.py`, `baselines/train/pixelnerf.py`  
+**Change:** Updated `encode_source_view` and `encode_source_view_repeated` to take `source_azimuth: float = 0.0`. Updated `pixelnerf.py`'s training loop to sample random `(src_idx, tgt_idx)` pairs from all 93 pre-rendered views, passing `source_azimuth` to `encode_source_view` and rendering target view at `target_azimuth`.  
+**Why:** Enforces complete random pair sampling across the entire pre-rendered 93-view cache, preventing source-view shortcut memorization at 0° and learning arbitrary relative view geometry invariants.  
+**Verification:** `python run_all_tests_isolate.py` passes all unit and regression test suites.

@@ -144,17 +144,50 @@ def compute_lpips(pred: torch.Tensor, gt: torch.Tensor) -> float:
     return dist.mean().item()
 
 
-def get_train_val_patient_dirs(rendered_dir: str, val_ratio: float = 0.15, seed: int = 42) -> tuple[list[str], list[str]]:
+def get_train_val_patient_dirs(
+    rendered_dir: str,
+    val_ratio: float = 0.15,
+    seed: int = 42,
+    exclude_patients: set[str] | list[str] | None = None,
+) -> tuple[list[str], list[str]]:
     """Retrieves patient directories from rendered_dir.
     
     If rendered_dir/val is empty or missing, carves out a deterministic
     val_ratio split (default: 15%) from rendered_dir/train using a fixed random seed.
+
+    Args:
+        rendered_dir: Path to rendered directory containing train/ or val/ subdirectories.
+        val_ratio: Fraction of train data to carve out for val split if val/ missing.
+        seed: Random seed for split shuffling.
+        exclude_patients: List/set of patient directory basenames to exclude (e.g. corrupted scans).
+            Defaults to {"mela_0005"}.
     """
+    if exclude_patients is None:
+        exclude_patients = {"mela_0005"}
+    else:
+        exclude_patients = set(exclude_patients)
+
     train_dir = os.path.join(rendered_dir, "train")
     val_dir = os.path.join(rendered_dir, "val")
 
-    val_patient_dirs = sorted([os.path.join(val_dir, d) for d in os.listdir(val_dir) if os.path.isdir(os.path.join(val_dir, d))]) if os.path.exists(val_dir) else []
-    train_patient_dirs = sorted([os.path.join(train_dir, d) for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d))]) if os.path.exists(train_dir) else []
+    val_patient_dirs = (
+        sorted([
+            os.path.join(val_dir, d)
+            for d in os.listdir(val_dir)
+            if os.path.isdir(os.path.join(val_dir, d)) and d not in exclude_patients
+        ])
+        if os.path.exists(val_dir)
+        else []
+    )
+    train_patient_dirs = (
+        sorted([
+            os.path.join(train_dir, d)
+            for d in os.listdir(train_dir)
+            if os.path.isdir(os.path.join(train_dir, d)) and d not in exclude_patients
+        ])
+        if os.path.exists(train_dir)
+        else []
+    )
 
     if not val_patient_dirs and train_patient_dirs:
         rng = random.Random(seed)
@@ -233,7 +266,7 @@ def build_perspective_ray_points(
 
     half_extent = math.tan(math.radians(fov) / 2.0)
     px = torch.linspace(-half_extent, half_extent, grid_res, device=device)
-    py = torch.linspace(-half_extent, half_extent, grid_res, device=device)
+    py = torch.linspace(half_extent, -half_extent, grid_res, device=device)
     grid_y, grid_x = torch.meshgrid(py, px, indexing="ij")
     dirs_cam = torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=-1).reshape(-1, 3)
     dirs_world = F.normalize(dirs_cam @ R.T, dim=-1)
@@ -262,7 +295,8 @@ def perspective_ray_march(
     reduction: str = "attenuation_sum",
     pts: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Ray-marches through implicit/voxel field to produce 2D projections.
+    """
+    Ray-marches through implicit/voxel field to produce 2D projections.
 
     Args:
         sample_fn: Query function mapping [N, 3] points to [N, 1] density.

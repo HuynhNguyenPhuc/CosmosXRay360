@@ -69,8 +69,9 @@ def build_multiview_grid(
     indices = sorted(azimuth_indices)
     n = len(indices)
 
-    # Convert view indices to azimuth degrees
-    degrees = [idx / total_gt_views * 360.0 for idx in indices]
+    # Convert view indices to azimuth degrees (using endpoint-inclusive N-1 divisor)
+    denom = max(1, total_gt_views - 1)
+    degrees = [idx / denom * 360.0 for idx in indices]
     span = degrees[-1] - degrees[0] if n > 1 else 0.0
 
     # 1. Generate predicted views using model wrapper

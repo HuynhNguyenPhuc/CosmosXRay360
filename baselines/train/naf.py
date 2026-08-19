@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 
+import numpy as np
 import torch
 import torchvision.transforms.functional as TF
 from PIL import Image
@@ -84,16 +85,24 @@ def train_naf(args: argparse.Namespace) -> None:
 
     logger.info(f"Found {len(train_patient_dirs)} train cases and {len(val_patient_dirs)} val cases for NAF.")
 
-    def cache_target_projs(patient_dirs: list[str]) -> list[torch.Tensor]:
+    def cache_target_projs(patient_dirs: list[str]) -> list[dict]:
         cached = []
 
         for pat_path in patient_dirs:
-            pa_file = os.path.join(pat_path, "pa.png")
-            if not os.path.exists(pa_file):
+            views_dir = os.path.join(pat_path, "views")
+            if not os.path.exists(views_dir):
+                pa_file = os.path.join(pat_path, "pa.png")
+                if os.path.exists(pa_file):
+                    cached.append({"projs": [TF.to_tensor(Image.open(pa_file).convert("L"))], "angles": [0.0]})
                 continue
 
-            pa_tensor = TF.to_tensor(Image.open(pa_file).convert("L"))
-            cached.append(pa_tensor)
+            view_files = sorted(f for f in os.listdir(views_dir) if f.endswith(".png"))
+            if not view_files:
+                continue
+
+            view_tensors = [TF.to_tensor(Image.open(os.path.join(views_dir, vf)).convert("L")) for vf in view_files]
+            angles = list(np.linspace(0.0, 360.0, len(view_files)))
+            cached.append({"projs": view_tensors, "angles": angles})
 
         return cached
 
@@ -104,6 +113,14 @@ def train_naf(args: argparse.Namespace) -> None:
     val_cached_projs = cache_target_projs(
         val_patient_dirs[:args.max_val_samples] if args.max_val_samples else val_patient_dirs
     )
+
+    # Fixed validation pairs with reproducible seed
+    val_rng = np.random.RandomState(42)
+    val_pairs = []
+    for item in val_cached_projs:
+        n_views = len(item["projs"])
+        tgt_idx = val_rng.randint(1, n_views) if n_views > 1 else 0
+        val_pairs.append((item["projs"][tgt_idx], float(item["angles"][tgt_idx])))
 
     viz_patient_dir = val_patient_dirs[0] if val_patient_dirs else None
 
@@ -126,9 +143,14 @@ def train_naf(args: argparse.Namespace) -> None:
         epoch_train_loss = 0.0
         num_train_steps = 0
 
-        for target_proj in train_cached_projs:
+        for item in train_cached_projs:
+            n_views = len(item["projs"])
+            tgt_idx = np.random.randint(0, n_views)
+            target_proj = item["projs"][tgt_idx]
+            target_azimuth = float(item["angles"][tgt_idx])
+
             loss = fit_density_field(
-                model, target_proj, BOUND, device, iterations=args.iters_per_sample, lr=args.lr
+                model, target_proj, BOUND, device, iterations=args.iters_per_sample, lr=args.lr, azimuth=target_azimuth,
             )
             epoch_train_loss += loss
             num_train_steps += 1
@@ -139,11 +161,11 @@ def train_naf(args: argparse.Namespace) -> None:
         epoch_val_loss = 0.0
         num_val_steps = 0
 
-        for target_proj in val_cached_projs:
+        for target_proj, target_azimuth in val_pairs:
             model_val = copy.deepcopy(model)
 
             loss = fit_density_field(
-                model_val, target_proj, BOUND, device, iterations=args.val_iters_per_sample, lr=args.lr
+                model_val, target_proj, BOUND, device, iterations=args.val_iters_per_sample, lr=args.lr, azimuth=target_azimuth,
             )
 
             epoch_val_loss += loss

@@ -162,18 +162,27 @@ def render_view(
         return fine_rgb
 
 
-def encode_source_view(model: "torch.nn.Module", source_img: "torch.Tensor", device: str) -> None:
-    """Encodes a single [1, 3, H, W] source image at azimuth=0 on the fixed orbit."""
-    encode_source_view_repeated(model, source_img, 1, device)
+def encode_source_view(
+    model: "torch.nn.Module",
+    source_img: "torch.Tensor",
+    device: str,
+    source_azimuth: float = 0.0,
+) -> None:
+    """Encodes a single [1, 3, H, W] source image at specified source_azimuth on the fixed orbit."""
+    encode_source_view_repeated(model, source_img, 1, device, source_azimuth=source_azimuth)
 
 
 def encode_source_view_repeated(
-    model: "torch.nn.Module", source_img: "torch.Tensor", n: int, device: str
+    model: "torch.nn.Module",
+    source_img: "torch.Tensor",
+    n: int,
+    device: str,
+    source_azimuth: float = 0.0,
 ) -> None:
-    """Encodes n copies of source image to match target pose batch size."""
+    """Encodes n copies of source image at specified source_azimuth to match target pose batch size."""
     focal = 0.5 * source_img.shape[-1] / np.tan(0.5 * np.radians(CAMERA_FOV_DEG))
     focal_t = torch.tensor(focal, device=device, dtype=torch.float32)
-    encode_pose = pose_spherical(0.0, CAMERA_ELEV_DEG, CAMERA_RADIUS).to(device)
+    encode_pose = pose_spherical(float(source_azimuth), CAMERA_ELEV_DEG, CAMERA_RADIUS).to(device)
     imgs = source_img.repeat(n, 1, 1, 1)
     poses = encode_pose.unsqueeze(0).repeat(n, 1, 1)
     model.encode(imgs.unsqueeze(1), poses=poses.unsqueeze(1), focal=focal_t)

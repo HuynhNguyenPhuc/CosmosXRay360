@@ -3,7 +3,7 @@ import pytest
 from models.mednerf import MedNeRFWrapper
 
 def test_mednerf_wrapper_fallback_gracefully(mock_frontal_cxr):
-    wrapper = MedNeRFWrapper()
+    wrapper = MedNeRFWrapper(iterations=5)
     
     if wrapper.model is None:
         views = wrapper.infer_multi_views(mock_frontal_cxr)

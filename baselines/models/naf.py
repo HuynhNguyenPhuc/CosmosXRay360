@@ -57,6 +57,7 @@ def fit_density_field(
     device: str,
     iterations: int = 200,
     lr: float = 1e-3,
+    azimuth: float = 0.0,
 ) -> float:
     """Optimizes coordinate MLP weights to reproduce a single 2D projection.
 
@@ -67,6 +68,7 @@ def fit_density_field(
         device: Compute device.
         iterations: Number of gradient steps.
         lr: Adam learning rate.
+        azimuth: Projection azimuth in degrees.
 
     Returns:
         Final MSE loss value.
@@ -83,9 +85,9 @@ def fit_density_field(
         target, size=(FIT_GRID_RES, FIT_GRID_RES), mode="bilinear", align_corners=False
     ).view(FIT_GRID_RES, FIT_GRID_RES)
 
-    # Build fixed frontal ray geometry once
+    # Build ray geometry for target azimuth
     fit_pts = build_perspective_ray_points(
-        azimuth=0.0, grid_res=FIT_GRID_RES, device=device, bound=safe_bound,
+        azimuth=azimuth, grid_res=FIT_GRID_RES, device=device, bound=safe_bound,
     )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -93,9 +95,9 @@ def fit_density_field(
     loss = torch.tensor(0.0)
     for _ in range(iterations):
         optimizer.zero_grad(set_to_none=True)
-        # Perspective ray marching against input view
+        # Perspective ray marching against input view at given azimuth
         pred_proj = perspective_ray_march(
-            sample_fn=model, azimuth=0.0, grid_res=FIT_GRID_RES, device=device,
+            sample_fn=model, azimuth=azimuth, grid_res=FIT_GRID_RES, device=device,
             bound=safe_bound, pts=fit_pts,
         )
         loss = F.mse_loss(pred_proj, target)
@@ -236,7 +238,9 @@ class NAFWrapper:
                 attenuations = attenuations_flat.reshape(1, 1, grid_size, grid_size, grid_size)
 
                 def sample_fn(pts: torch.Tensor) -> torch.Tensor:
-                    grid_coords = (pts / safe_bound).clamp(-1, 1).view(1, 1, 1, -1, 3)
+                    # Swap x and z ([2, 1, 0]) to align (x, y, z) pts with grid_sample's
+                    # expected coordinate ordering for the (D=x, H=y, W=z) attenuation volume.
+                    grid_coords = (pts[..., [2, 1, 0]] / safe_bound).clamp(-1, 1).view(1, 1, 1, -1, 3)
                     sampled = F.grid_sample(
                         attenuations, grid_coords, mode="bilinear",
                         padding_mode="zeros", align_corners=True,
