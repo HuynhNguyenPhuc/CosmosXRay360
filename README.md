@@ -4,11 +4,12 @@
 
 ---
 
-CosmosXRay360 is a medical imaging project built around **Cosmos Predict 2.5** for generating multi-view chest X-ray sequences from a single input X-ray image. The public workflow provides inference code, Gradio interface, and (coming soon) post-training code with post-training guides.
+CosmosXRay360 is a medical imaging project built around **Cosmos Predict 2.5** for generating multi-view chest X-ray sequences from a single input X-ray image. This branch provides inference code, a Gradio interface, and the full post-training pipeline (dataset rendering + Lightning trainer) used to produce the released checkpoint.
 
 
 ## 🔥 News
 
+- **2026-09-24** — `train` branch: DiffDRR-based dataset rendering, VAE latent pre-caching, and the Lightning post-training pipeline (FSDP EMA, physical loss regularizers, CFG-dropout anchoring)
 - **2026-04-21** — Initial release: inference code, Gradio demo, and model checkpoints
 
 
@@ -52,6 +53,7 @@ python app.py --checkpoint-path "hf://phuchuynh0904/CosmosXRay360/net_ema.pth" -
 - 📦 Export checkpoints from Lightning `.ckpt` to standalone `.pth`
 - 🔗 Flexible model loading: local paths, Hugging Face URIs, or Cosmos UUIDs
 - ⚡ CPU and GPU support with configurable inference parameters
+- 🏋️ Post-train on your own CT-derived DRR data, with FSDP EMA, physical loss regularizers, and VAE latent pre-caching
 
 
 ## 🎁 Model Checkpoints
@@ -115,10 +117,12 @@ uv pip install -e ".[cu128]"
 cd ..
 ```
 
-**4. Install Pytorch3D:**
+**4. (Optional) Install PyTorch3D:**
+
+The default rendering path (`renderers/diffdrr/`, used for dataset pre-rendering and training) depends only on `diffdrr` + `torchio`, both installed via `requirements.txt` in step 2. PyTorch3D is only needed for the legacy DVR renderer (`predict2_5/dvr/`), kept as a reference implementation that DiffDRR is checked against — skip this step unless you need that comparison.
 
 ```bash
-# Install pytorch3d for X-Ray volume rendering
+# Install pytorch3d for the legacy X-Ray volume renderer
 # (install with --no-build-isolation to ensure torch is available during build)
 uv pip install --no-build-isolation "git+https://github.com/facebookresearch/pytorch3d.git@stable"
 ```
@@ -247,6 +251,102 @@ python app.py --checkpoint-path checkpoints/net_ema.pth --share
 
 ---
 
+## 🏋️ Training
+
+CosmosXRay360 is post-trained on paired **CT-derived DRR (Digitally Reconstructed Radiograph) rotation videos**: 93 views spanning 0–360° azimuth, rendered from chest CT volumes with the [DiffDRR](https://github.com/eigenvivek/DiffDRR) renderer (`renderers/diffdrr/`). Training uses a cross-dataset **out-of-distribution (OOD) split** — train/val on **TCIA + MELA2022**, held-out test on **NSCLC-Radiomics (LUNG1)** — so never mix NSCLC cases into the training or caching steps below.
+
+### 1. Download the raw CT datasets
+
+Training expects raw CT volumes (`.nii.gz`) laid out as:
+
+```
+datasets/
+├── TCIA/images/*.nii.gz
+├── MELA2022/raw/train/images/*.nii.gz    # + raw/val/images/ (validation)
+└── NSCLC/processed/train/images/*.nii.gz # held-out OOD test set — never used for training
+```
+
+- **TCIA** and **NSCLC-Radiomics (LUNG1)** are public collections on [The Cancer Imaging Archive](https://www.cancerimagingarchive.net/); **MELA2022** is from the [MELA 2022 Grand Challenge](https://mela22.grand-challenge.org/).
+- If your team has an internal mirror on Google Cloud Storage, `scripts/download_folder_from_gcs.py` pulls a GCS folder in parallel:
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
+
+uv run python scripts/download_folder_from_gcs.py \
+  --bucket   <your-gcs-bucket> \
+  --gcs-folder data/TCIA/ \
+  --local-dir  datasets/TCIA \
+  --num-workers 8
+# repeat per dataset (TCIA / MELA2022 / NSCLC), adjusting --gcs-folder and --local-dir
+```
+
+Ask your team lead for the bucket name and folder layout if you don't already have access.
+
+### 2. Pre-render DRR projections
+
+Converts raw CT volumes into 93-view 360° X-ray projections (plus PA/LAT views), populating `datasets/pre_rendered/{train,test}/<patient>/{pa.png,lat.png,views/*.png}`:
+
+```bash
+uv run python datasets/pre_render_diffdrr.py \
+  --dest_dir datasets/pre_rendered \
+  --device cuda
+```
+
+Useful flags: `--datasets TCIA,MELA2022` to render a subset, `--max_files N` for a quick dry run, `--overwrite` to re-render existing cases.
+
+### 3. (Optional) Pre-encode VAE latents
+
+Skips repeated VAE encoding during training by caching Wan2.1 VAE latents to disk once — recommended for multi-epoch runs:
+
+```bash
+uv run python scripts/pre_encode_latents.py \
+  --dataset_dir datasets/pre_rendered \
+  --output_dir  datasets/pre_rendered_latents \
+  --batch_size 1 \
+  --device cuda
+```
+
+### 4. Launch training
+
+```bash
+uv run python predict2_5/trainer.py \
+  --dataset_path datasets/pre_rendered \
+  --num_gpus 4 \
+  --strategy fsdp \
+  --batch_size 1 \
+  --precision bf16-mixed \
+  --experiment_name my_run \
+  --output_dir outputs
+```
+
+Add `--use_latent_cache --latent_cache_dir datasets/pre_rendered_latents` if you ran step 3. Other notable flags (see `predict2_5/trainer.py`'s `parse_args()` for the full list):
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--model_size` | `2B` | DiT size (`2B`/`7B`/`14B`) |
+| `--resume_from_checkpoint` | `None` | Resume from a Lightning `.ckpt` |
+| `--enable_ema` / `--ema_rate` | `True` / `0.10` | FSDP-sharded EMA of the weights |
+| `--gamma_side` / `--loss_atten_weight` | `1.0` / `0.02` | Physical loss regularizer weights (angular offset, attenuation mass) |
+| `--learning_rate` / `--max_iters` | `2^-14.5` / `100000` | Core optimization hyperparameters |
+| `--build_cache_only` | off | Prepare the disk cache and exit, without training |
+
+Checkpoints and TensorBoard logs land under `<output_dir>/<experiment_name>/`.
+
+### 5. Export a checkpoint for inference
+
+Converts a Lightning `.ckpt` into the standalone `.pth` + `config.json` pair the `Inferencer` (and `app.py`) expect:
+
+```bash
+uv run python -m scripts.export_dit_checkpoint export \
+  --ckpt  outputs/my_run/checkpoints/epoch=0042.ckpt \
+  --out   exported/dit_ema_epoch42.pth \
+  --export-config
+```
+
+By default this exports the EMA weights (`--source net_ema`); pass `--source net` for the raw weights. See [Code Usage](#code-usage) above to load the exported checkpoint with `Inferencer`.
+
+---
+
 ## Model Description
 
 **Task:** Novel View Synthesis for X-Ray images
@@ -273,6 +373,7 @@ python app.py --checkpoint-path checkpoints/net_ema.pth --share
 CosmosXRay360 builds on the following foundational works:
 
 - **[NVIDIA Cosmos Predict 2.5](https://github.com/nvidia-cosmos/cosmos-predict2.5)** — Foundation model architecture and training scripts
+- **[DiffDRR](https://github.com/eigenvivek/DiffDRR)** — Differentiable, Siddon-Jacob ray-tracing DRR renderer used for dataset generation
 - **[MONAI](https://github.com/Project-MONAI/MONAI)** — Medical imaging preprocessing and evaluation tools
 
 We are grateful to the broader open-source community for their valuable tools and contributions.
