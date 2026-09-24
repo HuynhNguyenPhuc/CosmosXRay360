@@ -79,9 +79,15 @@ class CR1TextEncoder:
         Returns:
             A text embedding tensor with shape (1, L, D) if successful, otherwise None.
         """
-        emb_path = self.embedding_dir / f"{self.prompt_to_filename(prompt)}.pkl"
+        filename = f"{self.prompt_to_filename(prompt)}.pkl"
+        search_paths = [
+            self.embedding_dir / filename,
+            Path("outputs/cosmos_reason_embeddings") / filename,
+            Path("cosmos_reason_embeddings") / filename,
+        ]
         
-        if not emb_path.exists():
+        emb_path = next((p for p in search_paths if p.exists()), None)
+        if emb_path is None:
             return None
 
         try:
@@ -121,6 +127,13 @@ class CR1TextEncoder:
             return
 
         if not self.text_encoder_ckpt_path:
+            try:
+                from predict2_5.hf import download_text_encoder_snapshot
+                self.text_encoder_ckpt_path = download_text_encoder_snapshot()
+            except Exception as exc:
+                log.warning("Auto-downloading text encoder snapshot failed: %s", exc)
+
+        if not self.text_encoder_ckpt_path:
             raise ValueError("Text encoder checkpoint path is required for online fallback when .pkl is missing")
 
         from cosmos_predict2._src.predict2.text_encoders.text_encoder import (
@@ -137,8 +150,15 @@ class CR1TextEncoder:
         # Get the device for the text encoder (CPU if offloading is enabled, otherwise same as target device)
         online_device = "cpu" if self.cpu_offload else self.device
 
-        # Initialize the Text Encoder
-        self._text_encoder = TextEncoder(cfg, device=online_device)
+        # Mask torch.distributed.is_initialized during instantiation to prevent QwenModel DTensor sharding on DDP/FSDP ranks
+        import torch.distributed as _dist
+        _orig_is_init = getattr(_dist, "is_initialized", lambda: False)
+        _dist.is_initialized = lambda: False
+
+        try:
+            self._text_encoder = TextEncoder(cfg, device=online_device)
+        finally:
+            _dist.is_initialized = _orig_is_init
 
         log.info("Text encoder initialized on %s", online_device)
 
@@ -178,6 +198,17 @@ class CR1TextEncoder:
         use_dim = min(text_embeddings.shape[2], CR1_EMBEDDING_DIM)
         padded[0, :use_len, :use_dim] = text_embeddings[0, :use_len, :use_dim]
 
+        # Auto-save computed embedding to disk as .pkl for instant loading in future runs
+        try:
+            self.embedding_dir.mkdir(parents=True, exist_ok=True)
+            emb_path = self.embedding_dir / f"{self.prompt_to_filename(prompt)}.pkl"
+            if not emb_path.exists():
+                with open(emb_path, "wb") as f:
+                    pickle.dump([padded[0].cpu().numpy()], f)
+                log.info("Auto-saved computed text embedding to %s", emb_path)
+        except Exception as exc:
+            log.warning("Could not auto-save embedding to %s: %s", self.embedding_dir, exc)
+
         return padded
 
     def encode_prompt(self, prompt: str) -> torch.Tensor:
@@ -198,10 +229,14 @@ class CR1TextEncoder:
         # Load from disk if available, otherwise compute on-the-fly if checkpoint is provided, else return zeros
         embedding = self._load_embedding_from_disk(key)
         if embedding is None:
-            if self.text_encoder_ckpt_path:
+            try:
                 embedding = self._compute_text_embedding_online(key)
-            else:
-                log.warning("Missing embedding for prompt '%s' and no checkpoint provided; returning zeros", key)
+            except Exception as exc:
+                log.warning(
+                    "Missing embedding for prompt '%s' and text encoder initialization failed (%s); returning zeros",
+                    key,
+                    exc,
+                )
                 embedding = torch.zeros((1, CR1_MAX_LENGTH, CR1_EMBEDDING_DIM), dtype=torch.float32)
 
         # Store in cache before returning

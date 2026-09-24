@@ -164,7 +164,6 @@ class ScreenCentricXRayVolumeRenderer(BaseXRayVolumeRenderer):
             n_pts_per_ray=self.n_pts_per_ray,
             min_depth=self.min_depth,
             max_depth=self.max_depth,
-            ndc_extent=self.ndc_extent,
             stratified_sampling=False, 
         )
 
@@ -194,6 +193,5 @@ class ObjectCentricXRayVolumeRenderer(BaseXRayVolumeRenderer):
             n_pts_per_ray=self.n_pts_per_ray,
             min_depth=self.min_depth,
             max_depth=self.max_depth,
-            ndc_extent=self.ndc_extent,
             stratified_sampling=False, 
         )

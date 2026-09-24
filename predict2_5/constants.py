@@ -13,7 +13,7 @@ DEFAULT_CT_DIRS = [
 
 DEFAULT_XR_DIR = "data/VinDr/v1/processed/"
 
-DEFAULT_EMBEDDING_DIR = "cosmos_reason_embeddings"
+DEFAULT_EMBEDDING_DIR = "outputs/cosmos_reason_embeddings"
 
 # ============================================================
 # Cosmos-Reason1 Text Encoder

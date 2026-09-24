@@ -9,7 +9,12 @@ import nibabel as nib
 import numpy as np
 
 import torch
-from torchvision.io import write_video
+
+try:
+    from torchvision.io import write_video
+    HAVE_TORCHVISION_IO = True
+except ImportError:
+    HAVE_TORCHVISION_IO = False
 
 
 def save_vid_as_mp4(
@@ -30,15 +35,23 @@ def save_vid_as_mp4(
 
     # Scale to [0, 255] and convert to uint8
     vid = (vid * 255).clamp(0, 255).to(torch.uint8)
-
-    # Convert from (T, H, W) to (T, H, W, 3) for RGB
-    vid = vid.unsqueeze(-1).expand(-1, -1, -1, 3)  # (T, H, W, 3)
+    vid_np = vid.cpu().numpy()  # (T, H, W)
 
     # Save as MP4
     os.makedirs(os.path.dirname(out), exist_ok=True)
 
-    # Use torchvision's write_video for efficient video encoding
-    write_video(out, vid.cpu(), fps=fps, video_codec="libx264", options={"crf": "23"})
+    import cv2
+    T, H, W = vid_np.shape
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(out, fourcc, fps, (W, H), isColor=True)
+    try:
+        for i in range(T):
+            frame = vid_np[i]
+            # Convert grayscale (H, W) to BGR (H, W, 3) for VideoWriter
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            writer.write(frame_bgr)
+    finally:
+        writer.release()
 
 
 def save_img_as_png(

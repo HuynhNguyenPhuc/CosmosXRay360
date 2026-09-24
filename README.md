@@ -185,7 +185,7 @@ print(f"Generated {len(frames)} frames of shape {frames[0].shape}")
 
 for idx, frame in enumerate(frames):
     Image.fromarray(frame).save(f"output/frame_{idx:03d}.png")
-````
+```
 
 ### Option 2: Load from Local Files
 
